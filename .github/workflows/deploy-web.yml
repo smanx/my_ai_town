@@ -1,0 +1,101 @@
+name: deploy-web
+
+on:
+  workflow_dispatch:
+    inputs:
+      godot_version:
+        description: Godot version to export with
+        required: false
+        default: "4.7"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deploy-web
+  cancel-in-progress: false
+
+env:
+  GODOT_VERSION: ${{ inputs.godot_version || '4.7' }}
+
+jobs:
+  export-web:
+    name: Export Web and push to web branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Cache Godot binary
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/godot-bin
+          key: godot-${{ env.GODOT_VERSION }}-linux-x86_64
+
+      - name: Download Godot
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/godot-bin
+          curl -sSL -o /tmp/godot.zip \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_linux.x86_64.zip"
+          unzip -q /tmp/godot.zip -d /tmp/godot-extract
+          mv /tmp/godot-extract/Godot_v${GODOT_VERSION}-stable_linux.x86_64 ~/godot-bin/godot
+          chmod +x ~/godot-bin/godot
+
+      - name: Add Godot to PATH
+        run: echo "$HOME/godot-bin" >> "$GITHUB_PATH"
+
+      - name: Cache export templates
+        id: templates-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/godot/export_templates
+          key: godot-export-templates-${{ env.GODOT_VERSION }}
+
+      - name: Download export templates
+        if: steps.templates-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o /tmp/templates.tpz \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-stable/Godot_v${GODOT_VERSION}-stable_export_templates.tpz"
+          unzip -q /tmp/templates.tpz -d /tmp/templates-extract
+          mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          cp -r /tmp/templates-extract/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
+
+      - name: Import project
+        run: godot --headless --path game --import
+
+      - name: Export Web
+        run: |
+          godot --headless --path game --export-release "Web" \
+            "$GITHUB_WORKSPACE/release/ai-town-web/index.html"
+
+      - name: Deploy to web branch
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DEPLOY_DIR="$RUNNER_TEMP/web-deploy"
+          rm -rf "$DEPLOY_DIR"
+          mkdir -p "$DEPLOY_DIR"
+          git -C "$DEPLOY_DIR" init -q
+          git -C "$DEPLOY_DIR" remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if git -C "$DEPLOY_DIR" ls-remote --exit-code --heads origin web >/dev/null 2>&1; then
+            git -C "$DEPLOY_DIR" fetch -q origin web
+            git -C "$DEPLOY_DIR" checkout -q -B web FETCH_HEAD
+            git -C "$DEPLOY_DIR" rm -qrf --ignore-unmatch . >/dev/null 2>&1 || true
+          else
+            git -C "$DEPLOY_DIR" checkout -q -b web
+          fi
+          rm -rf "$DEPLOY_DIR"/*
+          cp -r "$GITHUB_WORKSPACE/release/ai-town-web/." "$DEPLOY_DIR"/
+          git -C "$DEPLOY_DIR" config user.name "github-actions[bot]"
+          git -C "$DEPLOY_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$DEPLOY_DIR" add -A
+          if ! git -C "$DEPLOY_DIR" diff --cached --quiet; then
+            git -C "$DEPLOY_DIR" commit -qm "Deploy web build from ${GITHUB_SHA}"
+          fi
+          git -C "$DEPLOY_DIR" push -q --force origin web

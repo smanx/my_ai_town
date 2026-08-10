@@ -70,6 +70,7 @@ jobs:
 
       - name: Export Web
         run: |
+          mkdir -p "$GITHUB_WORKSPACE/release/ai-town-web"
           godot --headless --path game --export-release "Web" \
             "$GITHUB_WORKSPACE/release/ai-town-web/index.html"
 

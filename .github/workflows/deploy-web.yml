@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y unzip git-lfs
+        run: sudo apt-get update && sudo apt-get install -y unzip rsync
 
       - name: Cache Godot binary
         id: godot-cache
@@ -67,14 +67,74 @@ jobs:
           mkdir -p "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
           cp -r /tmp/templates-extract/templates/* "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable/"
 
-      - name: Import project
-        run: godot --headless --path game --import
+      # GitHub blocks files >= 100MB, but the exported index.pck is ~278MB.
+      # The game sources must stay untouched, so all size reduction happens on
+      # a throwaway copy in $RUNNER_TEMP:
+      #   - textures: lossless PNG -> WebP lossy (quality 0.7, as set in the repo)
+      #   - audio: stereo 44.1kHz -> mono 22.05kHz (OGG, ambient/music)
+      # This shrinks index.pck to ~90MB. The cache below stores the fully
+      # imported game-build snapshot so unchanged sources skip the re-import.
+
+      - name: Prepare build copy (game/ is never modified)
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/game-build"
+          mkdir -p "$RUNNER_TEMP/game-build"
+          rsync -a --exclude 'web' game/ "$RUNNER_TEMP/game-build/"
+
+      - name: Patch import settings in build copy
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/game-build"
+          # Textures: lossless -> lossy WebP
+          find . -name '*.png.import' -print0 | xargs -0 -I{} sed -i \
+            -e 's/^compress\/mode=0$/compress\/mode=1/' \
+            -e 's/^compress\/lossy_quality=.*$/compress\/lossy_quality=0.7/' {}
+          # Audio: 44.1kHz stereo -> 22.05kHz mono (stays OGG)
+          find . -name '*.wav.import' -print0 | xargs -0 -I{} sed -i \
+            -e 's/^force\/mono=false$/force\/mono=true/' \
+            -e 's/^force\/max_rate=false$/force\/max_rate=true/' \
+            -e 's/^force\/max_rate_hz=44100$/force\/max_rate_hz=22050/' {}
+          # Enable WebP in the import pipeline
+          if ! grep -q '^textures/vram_compression/import_webp=true$' project.godot; then
+            sed -i '/^textures\/vram_compression\/import_etc2_astc=true$/a textures/vram_compression/import_webp=true' project.godot
+          fi
+
+      - name: Restore web-build cache
+        id: web-build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/game-build
+          key: web-build-v2-${{ env.GODOT_VERSION }}-${{ hashFiles('game/**') }}
+
+      - name: Import project (web build)
+        if: steps.web-build-cache.outputs.cache-hit != 'true'
+        run: godot --headless --path "$RUNNER_TEMP/game-build" --import
+
+      - name: Save web-build cache
+        if: steps.web-build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/game-build
+          key: web-build-v2-${{ env.GODOT_VERSION }}-${{ hashFiles('game/**') }}
 
       - name: Export Web
         run: |
           mkdir -p "$GITHUB_WORKSPACE/release/ai-town-web"
-          godot --headless --path game --export-release "Web" \
+          godot --headless --path "$RUNNER_TEMP/game-build" --export-release "Web" \
             "$GITHUB_WORKSPACE/release/ai-town-web/index.html"
+
+      - name: Check file sizes (GitHub 100MB limit)
+        run: |
+          set -euo pipefail
+          for f in "$GITHUB_WORKSPACE/release/ai-town-web"/*; do
+            size=$(stat -c %s "$f")
+            if [ "$size" -ge 104857600 ]; then
+              echo "ERROR: $(basename "$f") is $size bytes (>= 100MB), cannot push to GitHub." >&2
+              exit 1
+            fi
+          done
+          echo "All files under 100MB."
 
       - name: Deploy to web branch
         env:
@@ -85,7 +145,6 @@ jobs:
           rm -rf "$DEPLOY_DIR"
           mkdir -p "$DEPLOY_DIR"
           git -C "$DEPLOY_DIR" init -q
-          git -C "$DEPLOY_DIR" lfs install
           git -C "$DEPLOY_DIR" remote add origin "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           if git -C "$DEPLOY_DIR" ls-remote --exit-code --heads origin web >/dev/null 2>&1; then
             git -C "$DEPLOY_DIR" fetch -q origin web
@@ -96,7 +155,6 @@ jobs:
           fi
           rm -rf "$DEPLOY_DIR"/*
           cp -r "$GITHUB_WORKSPACE/release/ai-town-web/." "$DEPLOY_DIR"/
-          printf '*.pck filter=lfs diff=lfs merge=lfs -text\n*.wasm filter=lfs diff=lfs merge=lfs -text\n' > "$DEPLOY_DIR/.gitattributes"
           git -C "$DEPLOY_DIR" config user.name "github-actions[bot]"
           git -C "$DEPLOY_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git -C "$DEPLOY_DIR" add -A

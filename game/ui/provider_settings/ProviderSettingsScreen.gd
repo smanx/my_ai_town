@@ -24,6 +24,9 @@ const CompositeDesktop = preload(
 const FormalDialog = preload(
 	"res://ui/common/formal_dialog/FormalConfirmationDialog.gd"
 )
+const ENDPOINT_SECURITY := preload(
+	"res://common/ProviderEndpointSecurity.gd"
+)
 const CONNECTION_NAME_INPUT_TEXTURE := preload(
 	"res://assets/ui/common/formal_dialog_v1/runtime/"
 	+ "formal_dialog_connection_name_input_v2_1024x192.png"
@@ -50,6 +53,7 @@ var _discard_confirmation: FormalDialog
 var _delete_model_confirmation: FormalDialog
 var _delete_connection_confirmation: FormalDialog
 var _connection_name_dialog: FormalDialog
+var _insecure_http_confirmation: FormalDialog
 var _connection_name_edit: LineEdit
 var _connection_name_mode := ""
 var _connection_name_provider_id := ""
@@ -61,6 +65,7 @@ var _pending_connection_deletion: Dictionary = {}
 var _last_connection_deletion: Dictionary = {}
 var _blocked_model_assignment_context: Dictionary = {}
 var _pending_provider_selection: Dictionary = {}
+var _pending_insecure_http_save: Dictionary = {}
 var _discard_confirmation_action := ""
 var _layout_profile := ""
 var _layout_root: Control
@@ -91,6 +96,7 @@ func _ready() -> void:
 	_build_delete_model_confirmation()
 	_build_delete_connection_confirmation()
 	_build_connection_name_dialog()
+	_build_insecure_http_confirmation()
 	_build_delete_model_blocked_dialog()
 	if _view_model.is_empty():
 		_view_model = _empty_view_model()
@@ -208,6 +214,29 @@ func _build_connection_name_dialog() -> void:
 	)
 	_connection_name_dialog.set_custom_content(_connection_name_edit)
 	add_child(_connection_name_dialog)
+
+
+func _build_insecure_http_confirmation() -> void:
+	if is_instance_valid(_insecure_http_confirmation):
+		return
+	_insecure_http_confirmation = FormalDialog.new()
+	_insecure_http_confirmation.name = "InsecureHttpConfirmation"
+	_insecure_http_confirmation.title = "允许未加密连接？"
+	_insecure_http_confirmation.dialog_text = (
+		"这个地址使用未加密的 HTTP。API Key、提示词、居民记忆和对话内容"
+		+ "可能被同一网络中的其他人读取。\n\n"
+		+ "只在你信任这个服务和网络时继续。"
+	)
+	_insecure_http_confirmation.ok_button_text = "仍然使用"
+	_insecure_http_confirmation.cancel_button_text = "返回修改"
+	_insecure_http_confirmation.semantic_kind = "warning"
+	_insecure_http_confirmation.confirmed.connect(
+		_confirm_insecure_http_save
+	)
+	_insecure_http_confirmation.canceled.connect(
+		_cancel_insecure_http_save
+	)
+	add_child(_insecure_http_confirmation)
 
 
 func _request_create_compatible_connection() -> void:
@@ -359,8 +388,13 @@ func _has_unsaved_local_draft() -> bool:
 	var selected := _find_provider(_selected_provider_id)
 	if selected.is_empty():
 		return false
+	var saved_base_url := (
+		_connection_base_url(selected)
+		if _uses_local_service_url(selected)
+		else String(selected.get("baseUrl", ""))
+	)
 	return (
-		_draft_base_url != String(selected.get("baseUrl", ""))
+		_draft_base_url != saved_base_url
 		or not _draft_api_model.is_empty()
 	)
 
@@ -390,6 +424,7 @@ func bind_adapter(adapter: Object) -> void:
 	_provider_page = -1
 	_model_page = -1
 	_pending_provider_selection.clear()
+	_pending_insecure_http_save.clear()
 	_discard_confirmation_action = ""
 	_adapter = adapter
 	if _adapter == null:
@@ -472,7 +507,11 @@ func apply_view_model(view_model: Dictionary) -> bool:
 			_draft_key_baseline = ""
 			_draft_key_dirty = false
 			_show_key = false
-			_draft_base_url = str(selected.get("baseUrl", ""))
+			_draft_base_url = (
+				_connection_base_url(selected)
+				if _uses_local_service_url(selected)
+				else str(selected.get("baseUrl", ""))
+			)
 			_draft_api_model = ""
 		elif (
 			operation_status_text == "success"
@@ -1199,8 +1238,60 @@ func _on_composite_ui_action(
 			)
 			if not provider.is_empty():
 				_select_provider(provider)
+		&"provider_settings.save_base_url", \
+		&"provider_settings.save_connection":
+			_request_provider_save(action, payload)
 		_:
 			_dispatch_intent(action, payload)
+
+
+func _request_provider_save(
+	action: StringName,
+	payload: Dictionary,
+) -> void:
+	var endpoint_value: Variant = payload.get("baseUrl", "")
+	if typeof(endpoint_value) != TYPE_STRING:
+		_dispatch_intent(action, payload)
+		return
+	var endpoint := endpoint_value as String
+	if (
+		endpoint != endpoint.strip_edges()
+		or not ENDPOINT_SECURITY.requires_insecure_http_consent(endpoint)
+	):
+		_dispatch_intent(action, payload)
+		return
+	var provider := _find_provider(String(payload.get("providerId", "")))
+	if (
+		String(provider.get("baseUrl", "")) == endpoint
+		and bool(provider.get("insecureHttpApproved", false))
+	):
+		var approved_payload := payload.duplicate(true)
+		approved_payload["allowInsecureHttp"] = true
+		_dispatch_intent(action, approved_payload)
+		return
+	_pending_insecure_http_save = {
+		"action": action,
+		"payload": payload.duplicate(true),
+	}
+	_insecure_http_confirmation.popup_centered()
+
+
+func _confirm_insecure_http_save() -> void:
+	if _pending_insecure_http_save.is_empty():
+		return
+	var action := StringName(
+		_pending_insecure_http_save.get("action", &"")
+	)
+	var payload := (
+		_pending_insecure_http_save.get("payload", {}) as Dictionary
+	).duplicate(true)
+	_pending_insecure_http_save.clear()
+	payload["allowInsecureHttp"] = true
+	_dispatch_intent(action, payload)
+
+
+func _cancel_insecure_http_save() -> void:
+	_pending_insecure_http_save.clear()
 
 
 func _build_header() -> Control:
@@ -1692,8 +1783,9 @@ func _build_detail() -> Control:
 		detail.add_child(_build_custom_connection_picker(selected))
 	detail.add_child(_detail_divider())
 	detail.add_child(_build_key_section(selected))
-	detail.add_child(_detail_divider())
-	detail.add_child(_build_base_url_section(selected))
+	if not _uses_local_service_url(selected):
+		detail.add_child(_detail_divider())
+		detail.add_child(_build_base_url_section(selected))
 	detail.add_child(_detail_divider())
 	detail.add_child(_build_models_section(selected))
 	detail.add_child(_detail_divider())
@@ -1839,8 +1931,9 @@ func _build_custom_connection_picker(selected: Dictionary) -> Control:
 
 
 func _build_key_section(provider: Dictionary) -> Control:
+	var local_service := _uses_local_service_url(provider)
 	var panel := PanelContainer.new()
-	panel.name = "ApiKeyPanel"
+	panel.name = "ServiceUrlPanel" if local_service else "ApiKeyPanel"
 	panel.add_theme_stylebox_override(
 		"panel",
 		ProviderTheme.empty_style()
@@ -1851,8 +1944,8 @@ func _build_key_section(provider: Dictionary) -> Control:
 	column.add_theme_constant_override("separation", 8)
 	panel.add_child(column)
 	column.add_child(_section_heading(
-		"API Key",
-		"仅保存在本机" if bool(provider.get("authRequired", true)) else "可选，仅保存在本机",
+		"服务地址" if local_service else "API Key",
+		"保存后自动读取模型" if local_service else "仅保存在本机",
 	))
 
 	var form: Container
@@ -1865,19 +1958,17 @@ func _build_key_section(provider: Dictionary) -> Control:
 
 	var key_data := provider.get("key", {}) as Dictionary
 	_key_edit = LineEdit.new()
-	_key_edit.name = "ApiKeyInput"
-	_key_edit.secret = not _show_key
+	_key_edit.name = "BaseUrlInput" if local_service else "ApiKeyInput"
+	_key_edit.secret = false if local_service else not _show_key
 	_key_edit.secret_character = "•"
 	_key_edit.placeholder_text = (
-		"已安全保存，输入新 Key 可替换"
+		"请输入本地服务地址"
+		if local_service
+		else "已安全保存，输入新 Key 可替换"
 		if bool(key_data.get("saved", false))
-		else (
-			"请输入 API Key"
-			if bool(provider.get("authRequired", true))
-			else "本地服务通常无需填写"
-		)
+		else "请输入 API Key"
 	)
-	_key_edit.text = _draft_key
+	_key_edit.text = _draft_base_url if local_service else _draft_key
 	_key_edit.custom_minimum_size = Vector2(
 		220 if _is_phone_profile() else 320,
 		_field_height()
@@ -1899,11 +1990,14 @@ func _build_key_section(provider: Dictionary) -> Control:
 		[24, 12, 24, 12]
 	)
 	_key_edit.text_changed.connect(func(value: String) -> void:
-		_draft_key = value
-		_draft_key_dirty = (
-			not value.is_empty()
-			and value != _draft_key_baseline
-		)
+		if local_service:
+			_draft_base_url = value
+		else:
+			_draft_key = value
+			_draft_key_dirty = (
+				not value.is_empty()
+				and value != _draft_key_baseline
+			)
 		_sync_key_save_enabled()
 	)
 	form.add_child(_key_edit)
@@ -1923,7 +2017,10 @@ func _build_key_section(provider: Dictionary) -> Control:
 	reveal.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	reveal.name = "RevealKeyButton"
 	reveal.set_meta("gate_id", "key_reveal")
+	reveal.visible = not local_service
 	reveal.disabled = (
+		local_service
+		or
 		_draft_key.is_empty()
 		and not bool(key_data.get("saved", false))
 	)
@@ -1943,13 +2040,17 @@ func _build_key_section(provider: Dictionary) -> Control:
 	_save_key_button.set_meta("gate_id", "key_save")
 	_sync_key_save_enabled()
 	_save_key_button.pressed.connect(func() -> void:
-		var submitted_key := _draft_key
+		var payload := {
+			"providerId": str(provider.get("providerId", "")),
+			"apiKey": "" if local_service else _draft_key,
+		}
+		if local_service:
+			payload["baseUrl"] = _draft_base_url
 		_dispatch_intent(
-			&"provider_settings.save_key",
-			{
-				"providerId": str(provider.get("providerId", "")),
-				"apiKey": submitted_key,
-			}
+			&"provider_settings.save_connection"
+			if local_service
+			else &"provider_settings.save_key",
+			payload,
 		)
 		_queue_layout_rebuild()
 	)
@@ -1962,7 +2063,10 @@ func _build_key_section(provider: Dictionary) -> Control:
 	delete.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	delete.name = "DeleteKeyButton"
 	delete.set_meta("gate_id", "key_delete")
+	delete.visible = not local_service
 	delete.disabled = (
+		local_service
+		or
 		not _action_enabled("deleteKey")
 		or not bool(key_data.get("saved", false))
 		or _operation_loading()
@@ -2098,6 +2202,8 @@ func _build_models_section(provider: Dictionary) -> Control:
 				)
 				else "保存 API Key 后将自动读取可用模型。"
 				if str(provider.get("providerId", "")) == "volcengine-ark"
+				else "保存服务地址后将自动读取可用模型。"
+				if _uses_local_service_url(provider)
 				else "当前 Provider 没有可展示模型。"
 			)
 		))
@@ -2503,6 +2609,14 @@ func _refresh_operation_state() -> void:
 func _sync_key_save_enabled() -> void:
 	if not is_instance_valid(_save_key_button):
 		return
+	var selected := _find_provider(_selected_provider_id)
+	if _uses_local_service_url(selected):
+		_save_key_button.disabled = (
+			_draft_base_url.strip_edges().is_empty()
+			or not _action_enabled("saveConnection")
+			or _operation_loading()
+		)
+		return
 	_save_key_button.disabled = (
 		_draft_key.is_empty()
 		or not _draft_key_dirty
@@ -2813,6 +2927,22 @@ func _provider_belongs_to_custom_group(provider: Dictionary) -> bool:
 	] or provider_id.begins_with("openai-compatible-")
 
 
+func _uses_local_service_url(provider: Dictionary) -> bool:
+	return (
+		bool(provider.get("customGroup", false))
+		and not bool(provider.get("authRequired", true))
+	)
+
+
+func _connection_base_url(provider: Dictionary) -> String:
+	var saved_url := str(provider.get("baseUrl", "")).strip_edges()
+	return (
+		saved_url
+		if not saved_url.is_empty()
+		else str(provider.get("defaultBaseUrl", "")).strip_edges()
+	)
+
+
 func _action_enabled(action_key: String) -> bool:
 	var action := UiViewModel.action(_view_model, action_key)
 	return UiViewModel.action_enabled(action)
@@ -2847,7 +2977,11 @@ func _perform_provider_selection(provider: Dictionary) -> void:
 	_draft_key_baseline = ""
 	_draft_key_dirty = false
 	_show_key = false
-	_draft_base_url = str(provider.get("baseUrl", ""))
+	_draft_base_url = (
+		_connection_base_url(provider)
+		if _uses_local_service_url(provider)
+		else str(provider.get("baseUrl", ""))
+	)
 	_draft_api_model = ""
 	_dispatch_intent(
 		&"provider_settings.select_provider",

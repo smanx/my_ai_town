@@ -13,6 +13,15 @@ const FEEDBACK_SCENE := preload("res://ui/system_feedback/SystemFeedbackLayer.ts
 const RESIDENT_ACTION_MENU_SCENE := preload(
 	"res://ui/resident_action_menu/ResidentActionWorldMenu.tscn"
 )
+const RESIDENT_DETAIL_SCENE := preload(
+	"res://ui/resident_detail/ResidentDetailScreen.tscn"
+)
+const INNER_OBSERVATION_SCENE := preload(
+	"res://ui/inner_observation/InnerObservationOverlay.tscn"
+)
+const CONVERSATION_SCENE := preload(
+	"res://ui/conversation_unified/UnifiedConversationScreen.tscn"
+)
 const INDOOR_RETURN_TEXTURE := preload(
 	"res://assets/ui/indoor_overlay/runtime_skin_v4/composite/"
 	+ "indoor_return_button_park_v1.png"
@@ -316,6 +325,12 @@ func _route_scene(route: StringName) -> PackedScene:
 	# the same reliable route instead of discovering it through a late string load.
 	if route == &"resident_action_menu":
 		return RESIDENT_ACTION_MENU_SCENE
+	if route == &"resident_detail":
+		return RESIDENT_DETAIL_SCENE
+	if route == &"inner_observation":
+		return INNER_OBSERVATION_SCENE
+	if route in [&"chat", &"conversation_spectator"]:
+		return CONVERSATION_SCENE
 	var scene_path := String(ROUTE_SCENE_PATHS.get(route, ""))
 	if scene_path.is_empty():
 		return null
@@ -1128,11 +1143,9 @@ func _play_audio_cue(cue_id: String, volume_db: float = 0.0) -> void:
 func _on_hud_intent_requested(intent: StringName, payload: Dictionary) -> void:
 	match String(intent):
 		"town_hud.open_event":
-			_open_page_with_feedback(
-				&"bulletin_board",
-				_bulletin_route_payload(payload),
-				"公告栏暂时打不开，请稍后再试。",
-			)
+			# 兼容旧 HUD 意图：公告事件属于小镇日志事件链，
+			# 不再把玩家带回用来撰写公告的公告栏。
+			_open_town_log(payload)
 		"town_hud.open_bulletin":
 			_open_page_with_feedback(
 				&"bulletin_board",
@@ -1783,9 +1796,16 @@ func _on_inner_observation_intent(
 	_request_id: String,
 ) -> void:
 	var result := _dispatch_adapter(String(intent), payload)
+	if not bool(result.get("ok", false)):
+		var inner_page := _active_page as InnerObservationOverlay
+		if is_instance_valid(inner_page) and _active_route == &"inner_observation":
+			inner_page.recover_immediate_dispatch_failure(
+				intent,
+				result.duplicate(true),
+			)
+		return
 	if (
 		String(intent) == "inner_observation.exit"
-		and bool(result.get("ok", false))
 	):
 		_close_resident_view_and_restore_origin()
 

@@ -23,6 +23,7 @@ class AdapterHarness extends Node:
 	var fail_next_lifecycle_pause := false
 	var fail_next_lifecycle_resume := false
 	var fail_next_resident_view_begin := false
+	var fail_next_inner_observation_exit := false
 	var resident_view_phase := "running"
 	var resident_view_begin_count := 0
 	var world_menu_host: Node
@@ -107,6 +108,16 @@ class AdapterHarness extends Node:
 			return {
 				"ok": false,
 				"errorCode": "TEST_LIFECYCLE_RESUME_FAILED",
+				"retryable": true,
+			}
+		if (
+			intent == "inner_observation.exit"
+			and fail_next_inner_observation_exit
+		):
+			fail_next_inner_observation_exit = false
+			return {
+				"ok": false,
+				"errorCode": "TEST_INNER_OBSERVATION_EXIT_REJECTED",
 				"retryable": true,
 			}
 		if (
@@ -1269,6 +1280,15 @@ class ResultCollector:
 	func collect(value: Dictionary) -> void:
 		result = value.duplicate(true)
 
+
+class AgentGatewayPumpSpy:
+	extends Node
+	var pump_limits: Array[int] = []
+
+	func pump(max_requests := -1) -> int:
+		pump_limits.append(max_requests)
+		return 1
+
 const HOST_SCRIPT := preload(
 	"res://world/presentation/ui/TownUiRuntimeHost.gd"
 )
@@ -1505,6 +1525,36 @@ func _run_all() -> void:
 	_scenario_session_production_composition()
 	_scenario_hud_pause_clock()
 	_finish_suite("TOWN_UI_RUNTIME_PASS")
+
+
+func _verify_conversation_agent_dispatch_first_frame(runtime: Node) -> void:
+	var real_gateway := runtime.get("_agent_gateway") as Node
+	var gateway := AgentGatewayPumpSpy.new()
+	runtime.set("_agent_gateway", gateway)
+	runtime.call("_hold_agent_dispatch_for_conversation_first_frame")
+	runtime.call("_pump_agent_gateway_for_frame")
+	_expect_equal(
+		gateway.pump_limits,
+		[],
+		"conversation input leaves one process turn free for the first UI frame",
+	)
+	runtime.call("_pump_agent_gateway_for_frame")
+	_expect_equal(
+		gateway.pump_limits,
+		[1],
+		"conversation request resumes with the one-request frame budget",
+	)
+	runtime.call("_hold_agent_dispatch_for_conversation_first_frame")
+	runtime.call("_hold_agent_dispatch_for_conversation_first_frame")
+	runtime.call("_pump_agent_gateway_for_frame")
+	runtime.call("_pump_agent_gateway_for_frame")
+	_expect_equal(
+		gateway.pump_limits,
+		[1, 1],
+		"repeated same-frame holds coalesce without delaying extra frames",
+	)
+	runtime.set("_agent_gateway", real_gateway)
+	gateway.free()
 
 
 func _setup_ui_runtime_host_navigation() -> void:
@@ -2530,6 +2580,20 @@ func _scenario_ui_runtime_host_navigation() -> void:
 	_expect_context("resident_action_menu", true, resident_action_payload)
 	_expect_dispatch("avatar.focus_target", {"residentId": "resident-lin"})
 	_expect_single_active_page("resident focus route")
+	var resident_action_page := _active_route_page()
+	var resident_action_halos: Array[Node] = []
+	if resident_action_page != null:
+		resident_action_halos = resident_action_page.find_children(
+			"HaloAsset",
+			"TextureRect",
+			true,
+			false,
+		)
+	_expect_equal(
+		resident_action_halos.size(),
+		0,
+		"world resident action menu removes the rectangular halo layer",
+	)
 	# Simulate an Adapter rebind/session refresh that reset only its lifecycle
 	# phase while the Host and resident menu stayed mounted.
 	var resident_view_begin_count_before_inner := (
@@ -2560,12 +2624,26 @@ func _scenario_ui_runtime_host_navigation() -> void:
 		{"residentId": "resident-lin"},
 	)
 	_expect_single_active_page("resident inner route")
-	_host.call(
-		"_on_inner_observation_intent",
-		&"inner_observation.exit",
-		{"residentId": "resident-lin"},
-		1,
-		"inner-navigation-exit",
+	var inner_page := _active_route_page()
+	_adapter.fail_next_inner_observation_exit = true
+	_expect(
+		bool(inner_page.call("request_exit")),
+		"inner observation submits its first exit request",
+	)
+	var rejected_exit_state := inner_page.call("debug_state") as Dictionary
+	_expect_equal(
+		rejected_exit_state.get("exitPending"),
+		false,
+		"an immediate exit rejection releases the local pending state",
+	)
+	_expect_equal(
+		_host.call("current_route"),
+		&"inner_observation",
+		"an immediate exit rejection keeps the current page available for retry",
+	)
+	_expect(
+		bool(inner_page.call("request_exit")),
+		"inner observation accepts a retry after immediate rejection",
 	)
 	await process_frame
 	await process_frame
@@ -3373,8 +3451,91 @@ func _scenario_ui_runtime_host_navigation() -> void:
 					rebuilt_base_url_edit,
 					"Provider refresh restores Base URL input focus",
 				)
-				rebuilt_base_url_edit.text = "https://api.deepseek.com"
-				rebuilt_base_url_edit.text_changed.emit(rebuilt_base_url_edit.text)
+				_expect(
+					provider_page.find_child(
+						"InsecureHttpWarning",
+						true,
+						false,
+					) == null,
+					"Provider route does not use a passive HTTP warning label",
+				)
+				var remote_http_url := "http://api.example.com:3000/v1"
+				var dispatch_count_before_http := _adapter.dispatches.size()
+				rebuilt_base_url_edit.text = remote_http_url
+				rebuilt_base_url_edit.text_changed.emit(remote_http_url)
+				rebuilt_base_url_edit.text_submitted.emit(remote_http_url)
+				await process_frame
+				var http_confirmation := provider_page.find_child(
+					"InsecureHttpConfirmation",
+					true,
+					false,
+				) as FormalConfirmationDialog
+				_expect(
+					http_confirmation != null
+					and http_confirmation.visible
+					and http_confirmation.dialog_text.contains("API Key")
+					and http_confirmation.dialog_text.contains("居民记忆")
+					and http_confirmation.dialog_text.contains("对话内容"),
+					"Provider route explains remote HTTP exposure in the formal dialog",
+				)
+				_expect_equal(
+					_adapter.dispatches.size(),
+					dispatch_count_before_http,
+					"remote HTTP is not saved before confirmation",
+				)
+				var cancel_http := http_confirmation.find_child(
+					"Cancel",
+					true,
+					false,
+				) as Button
+				if cancel_http != null:
+					cancel_http.pressed.emit()
+				_expect_equal(
+					_adapter.dispatches.size(),
+					dispatch_count_before_http,
+					"canceling remote HTTP keeps the draft without saving",
+				)
+				rebuilt_base_url_edit.text_submitted.emit(remote_http_url)
+				await process_frame
+				var confirm_http := http_confirmation.find_child(
+					"Confirm",
+					true,
+					false,
+				) as Button
+				if confirm_http != null:
+					confirm_http.pressed.emit()
+				_expect_equal(
+					_adapter.dispatches.size(),
+					dispatch_count_before_http + 1,
+					"confirming remote HTTP dispatches one save",
+				)
+				var http_save := _adapter.dispatches.back() as Dictionary
+				_expect_equal(
+					http_save.get("intent"),
+					"provider_settings.save_base_url",
+					"remote HTTP confirmation resumes the original save action",
+				)
+				_expect_equal(
+					(http_save.get("payload", {}) as Dictionary).get(
+						"allowInsecureHttp"
+					),
+					true,
+					"remote HTTP confirmation carries explicit consent",
+				)
+	await _verify_local_provider_url_autodiscovery(
+		provider_page as ProviderSettingsScreen,
+		"ollama",
+		"Ollama（本地）",
+		"http://127.0.0.1:11434/v1",
+		20,
+	)
+	await _verify_local_provider_url_autodiscovery(
+		provider_page as ProviderSettingsScreen,
+		"lm-studio",
+		"LM Studio（本地）",
+		"http://127.0.0.1:1234/v1",
+		30,
+	)
 	var dispatch_count_before_back := _adapter.dispatches.size()
 	var escape := InputEventAction.new()
 	escape.action = &"ui_cancel"
@@ -4810,6 +4971,188 @@ func _provider_input_stability_view_model(revision: int) -> Dictionary:
 			"submittedAtMsec": 1,
 			"completedAtMsec": 0,
 		},
+		"error": null,
+	}
+
+
+func _verify_local_provider_url_autodiscovery(
+	screen: ProviderSettingsScreen,
+	provider_id: String,
+	display_name: String,
+	default_url: String,
+	revision: int,
+) -> void:
+	var initial_vm := _local_provider_url_view_model(
+		provider_id,
+		display_name,
+		default_url,
+		revision,
+	)
+	_expect(
+		screen.apply_view_model(initial_vm),
+		"%s local URL settings render" % display_name,
+	)
+	await process_frame
+	await process_frame
+	var url_edit := screen.find_child("BaseUrlInput", true, false) as LineEdit
+	var key_edit := screen.find_child("ApiKeyInput", true, false) as LineEdit
+	var save_button := screen.find_child("SaveKeyButton", true, false) as Button
+	_expect(key_edit == null, "%s does not expose an API Key input" % display_name)
+	_expect(
+		url_edit != null and url_edit.editable and url_edit.text == default_url,
+		"%s exposes its editable default service URL" % display_name,
+	)
+	_expect(
+		save_button != null and not save_button.disabled,
+		"%s enables saving from its service URL" % display_name,
+	)
+	var local_provider := (
+		(initial_vm.get("data", {}) as Dictionary).get("providers", []) as Array
+	)[0] as Dictionary
+	screen.call("_perform_provider_selection", local_provider)
+	await process_frame
+	await process_frame
+	var switched_url_edit := screen.find_child(
+		"BaseUrlInput",
+		true,
+		false,
+	) as LineEdit
+	var switched_save_button := screen.find_child(
+		"SaveKeyButton",
+		true,
+		false,
+	) as Button
+	_expect(
+		switched_url_edit != null and switched_url_edit.text == default_url,
+		"%s provider selection keeps the default service URL visible" % display_name,
+	)
+	_expect(
+		switched_save_button != null and not switched_save_button.disabled,
+		"%s provider selection keeps service URL saving enabled" % display_name,
+	)
+	var dispatch_start := _adapter.dispatches.size()
+	if switched_save_button != null and not switched_save_button.disabled:
+		switched_save_button.pressed.emit()
+	await process_frame
+	var save_dispatch := (
+		_adapter.dispatches[dispatch_start] as Dictionary
+		if _adapter.dispatches.size() > dispatch_start
+		else {}
+	)
+	_expect_equal(
+		save_dispatch.get("intent"),
+		"provider_settings.save_connection",
+		"%s saves the local connection instead of an API Key" % display_name,
+	)
+	_expect_equal(
+		(save_dispatch.get("payload", {}) as Dictionary).get("baseUrl"),
+		default_url,
+		"%s saves the visible service URL" % display_name,
+	)
+	_expect_equal(
+		(save_dispatch.get("payload", {}) as Dictionary).get("apiKey"),
+		"",
+		"%s saves without a placeholder API Key" % display_name,
+	)
+	var saved_vm := _local_provider_url_view_model(
+		provider_id,
+		display_name,
+		default_url,
+		revision + 1,
+	)
+	((saved_vm.get("data", {}) as Dictionary).get("providers", []) as Array)[0][
+		"baseUrl"
+	] = default_url
+	saved_vm["operation"] = {
+		"requestId": "%s-url-save" % provider_id,
+		"intent": "provider_settings.save_connection",
+		"status": "success",
+		"submittedAtMsec": 1,
+		"completedAtMsec": 2,
+	}
+	_expect(
+		screen.apply_view_model(saved_vm),
+		"%s accepts its saved URL result" % display_name,
+	)
+	await process_frame
+	await process_frame
+	await process_frame
+	var discovery_dispatch := (
+		_adapter.dispatches[_adapter.dispatches.size() - 1] as Dictionary
+		if not _adapter.dispatches.is_empty()
+		else {}
+	)
+	_expect_equal(
+		discovery_dispatch.get("intent"),
+		"provider_settings.discover_models",
+		"%s automatically reads models after saving its URL" % display_name,
+	)
+	_expect_equal(
+		(discovery_dispatch.get("payload", {}) as Dictionary).get("providerId"),
+		provider_id,
+		"%s model discovery targets the selected local service" % display_name,
+	)
+
+
+func _local_provider_url_view_model(
+	provider_id: String,
+	display_name: String,
+	default_url: String,
+	revision: int,
+) -> Dictionary:
+	var actions := {}
+	for action_key: String in [
+		"back",
+		"selectProvider",
+		"setProviderEnabled",
+		"saveConnection",
+		"discoverModels",
+		"saveApiModel",
+		"deleteApiModel",
+		"selectModel",
+		"checkConnection",
+	]:
+		actions[action_key] = {
+			"intent": "provider_settings.%s" % action_key,
+			"enabled": true,
+			"disabledReason": "",
+		}
+	return {
+		"scope": "provider_settings",
+		"status": "ready",
+		"revision": revision,
+		"data": {
+			"source": "runtime",
+			"capabilityMode": "formal",
+			"formalReady": true,
+			"pageTitle": "模型设置",
+			"selectedProviderId": provider_id,
+			"providers": [{
+				"providerId": provider_id,
+				"displayName": display_name,
+				"enabled": true,
+				"external": true,
+				"authRequired": false,
+				"customModels": true,
+				"customGroup": true,
+				"modelCatalogSupported": true,
+				"key": {"saved": false, "status": "optional"},
+				"baseUrl": "",
+				"defaultBaseUrl": default_url,
+				"models": [],
+				"discoveredModels": [],
+				"connection": {
+					"status": "not_configured",
+					"errorCode": "PROVIDER_MODEL_SELECTION_REQUIRED",
+				},
+			}],
+			"summary": {
+				"availableProviderCount": 0,
+				"enabledModelCount": 0,
+			},
+		},
+		"actions": actions,
+		"operation": {"status": "idle", "requestId": ""},
 		"error": null,
 	}
 
@@ -6714,6 +7057,7 @@ func _scenario_session_production_composition() -> void:
 		await process_frame
 		request_host.queue_free()
 		return
+	_verify_conversation_agent_dispatch_first_frame(runtime)
 	_expect_equal(runtime.call("get_connected_agent_names").size(), 15, "one gateway connects all 15 residents")
 	_expect_equal(gateway.call("get_connected_resident_ids").size(), 15, "gateway routes the stable ID set")
 	var first_id := String((bindings[0] as Dictionary).get("residentId", ""))
@@ -7367,6 +7711,105 @@ func _scenario_session_production_composition() -> void:
 		true,
 		"PauseMenuNavigationHost binds the same Adapter",
 	)
+	pause_host.call(
+		"_on_pause_intent_requested",
+		&"pause_menu.open_audio_video",
+		{},
+	)
+	pause_host.call(
+		"_on_pause_intent_requested",
+		&"pause_menu.open_audio_video",
+		{},
+	)
+	var pause_open_queued := pause_host.call("debug_snapshot") as Dictionary
+	_expect_equal(
+		pause_open_queued.get("route"),
+		"pause_menu",
+		"audio/display settings preserves the rendered pause route for the click frame",
+	)
+	_expect_equal(
+		pause_open_queued.get("pauseVisible"),
+		true,
+		"audio/display settings keeps the pause page visible while its route is pending",
+	)
+	_expect_equal(
+		pause_open_queued.get("settingsOpenPending"),
+		true,
+		"the first audio/display click owns the pending route transition",
+	)
+	await process_frame
+	var pause_settings_opened := pause_host.call("debug_snapshot") as Dictionary
+	_expect_equal(
+		pause_settings_opened.get("route"),
+		"audio_display_settings",
+		"audio/display settings opens after the stable pause frame",
+	)
+	_expect_equal(
+		pause_settings_opened.get("settingsInstanceCount"),
+		1,
+		"repeated audio/display clicks create only one settings page",
+	)
+	_expect_equal(
+		pause_settings_opened.get("pauseVisible"),
+		false,
+		"the pause page hides only after settings is mounted",
+	)
+	_expect_equal(
+		pause_host.call("close_audio_display_settings"),
+		true,
+		"audio/display settings returns to pause after the deferred transition",
+	)
+	await process_frame
+	var failed_descent_camera := runtime.get_node("PlayerCamera") as Camera2D
+	failed_descent_camera.zoom = Vector2.ONE * 1_000_000.0
+	var failed_descent := adapter.call(
+		"dispatch",
+		"town_hud.select_tool",
+		{"toolId": "avatar"},
+	) as Dictionary
+	_expect_equal(
+		failed_descent.get("ok"),
+		true,
+		"avatar entry remains accepted when the optional descent presentation cannot start",
+	)
+	_expect_equal(
+		runtime.call("get_avatar_mode"),
+		"avatar_descent",
+		"failed presentation keeps the transition locked until the deferred recovery turn",
+	)
+	_expect_equal(
+		(runtime.call("get_avatar_descent_snapshot") as Dictionary).get("active"),
+		false,
+		"invalid camera transform makes the real descent presentation reject start",
+	)
+	var repeated_failed_descent := adapter.call(
+		"dispatch",
+		"town_hud.select_tool",
+		{"toolId": "avatar"},
+	) as Dictionary
+	_expect_equal(
+		repeated_failed_descent.get("errorCode"),
+		"AVATAR_MODE_TRANSITION_IN_PROGRESS",
+		"a repeated click cannot start or reverse the failed descent recovery",
+	)
+	await process_frame
+	var recovered_avatar_state := runtime.call("get_runtime_state") as Dictionary
+	var recovered_player := runtime.get_node("Player") as CharacterBody2D
+	var recovered_feet := recovered_player.get_node("FeetCollision") as CollisionShape2D
+	_expect_equal(
+		runtime.call("get_avatar_mode"),
+		"avatar_active",
+		"failed descent presentation completes avatar entry on the next idle turn",
+	)
+	_expect_equal(
+		recovered_avatar_state.get("playerAvatarEnabled"),
+		true,
+		"failed presentation recovery enables avatar control",
+	)
+	_expect_equal(recovered_player.collision_layer, 2, "failed presentation recovery restores the avatar collision layer")
+	_expect_equal(recovered_player.collision_mask, 13, "failed presentation recovery restores the avatar collision mask")
+	_expect_equal(recovered_feet.disabled, false, "failed presentation recovery restores feet collision")
+	_expect_equal(failed_descent_camera.zoom, Vector2.ONE, "failed presentation recovery restores gameplay camera zoom")
 
 	var agent_participant: RefCounted = gateway.call("get_agent_save_participant")
 	var context := gateway.call("get_agent_save_context") as Dictionary

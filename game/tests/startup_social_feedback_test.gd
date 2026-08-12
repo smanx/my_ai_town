@@ -7,6 +7,8 @@ const HELP_FEEDBACK_PANEL := preload(
 	"res://ui/startup/StartupHelpFeedbackPanel.gd"
 )
 const FEEDBACK_REPORT := preload("res://ui/startup/GameFeedbackReport.gd")
+const BUILD_INFO := preload("res://ui/common/GameBuildInfo.gd")
+const BUILD_INFO_OVERLAY := preload("res://ui/common/GameBuildInfoOverlay.gd")
 
 
 func _initialize() -> void:
@@ -260,7 +262,38 @@ func _run() -> void:
 		)
 	checks += _expect(
 		not decoded_issue_url.contains("游戏版本"),
-		"Release 版本来源确定前，Issue 不得自动填写游戏版本。",
+		"源码开发环境没有构建信息时，Issue 不得冒充发行版本。",
+		failures,
+	)
+	checks += _expect(
+		BUILD_INFO.load_release_info("res://tests/not-a-build-info.json").is_empty(),
+		"构建信息文件不存在时必须按源码开发环境处理。",
+		failures,
+	)
+	checks += _expect(
+		BUILD_INFO.parse_json_text("not-json").is_empty(),
+		"损坏的构建信息不得进入玩家反馈。",
+		failures,
+	)
+	var parsed_build_info := BUILD_INFO.parse_json_text(JSON.stringify({
+		"schemaVersion": 1,
+		"version": "0.1.0-beta.1",
+		"tag": "v0.1.0-beta.1",
+		"channel": "beta",
+		"commit": "abcdef1",
+		"buildDate": "2026-08-11T00:00:00+00:00",
+	}))
+	checks += _expect(
+		String(parsed_build_info.get("version", "")) == "0.1.0-beta.1",
+		"合法构建信息必须能读取统一版本号。",
+		failures,
+	)
+	var release_issue_url := FEEDBACK_REPORT.build_issue_url({
+		"gameVersion": "0.1.0-beta.1",
+	}).uri_decode()
+	checks += _expect(
+		release_issue_url.contains("游戏版本：0.1.0-beta.1"),
+		"发行包提交 Issue 时必须自动携带游戏版本。",
 		failures,
 	)
 	checks += _expect(
@@ -269,6 +302,57 @@ func _run() -> void:
 		"反馈入口不得通过系统命令收集内存或显存信息。",
 		failures,
 	)
+	checks += _expect(
+		root.get_node_or_null("GameFlowHost/GameBuildInfoOverlay") == null,
+		"源码开发环境不得创建无内容的全局版本浮层。",
+		failures,
+	)
+
+	var build_info_overlay := BUILD_INFO_OVERLAY.new() as GameBuildInfoOverlay
+	root.add_child(build_info_overlay)
+	await process_frame
+	build_info_overlay.apply_release_info({})
+	var build_info_label := build_info_overlay.get_node_or_null(
+		"GameBuildInfoRoot/GameBuildInfoLabel"
+	) as Label
+	checks += _expect(
+		build_info_label != null and not build_info_overlay.visible,
+		"源码或无效构建信息不得显示虚假的发行版本。",
+		failures,
+	)
+	build_info_overlay.apply_release_info({
+		"version": "0.1.0-beta.2",
+		"tag": "v0.1.0-beta.2",
+		"channel": "beta",
+	})
+	checks += _expect(
+		build_info_overlay.visible
+		and build_info_label != null
+		and build_info_label.text
+		== "当前为测试版本，不代表最终品质 · v0.1.0-beta.2",
+		"测试发行包必须在全局右下角显示完整版本号和测试提示。",
+		failures,
+	)
+	if build_info_label != null:
+		checks += _expect(
+			build_info_label.anchor_left == 1.0
+			and build_info_label.anchor_top == 1.0
+			and build_info_label.offset_right == -24.0
+			and build_info_label.offset_bottom == -18.0,
+			"版本提示必须沿用贡献者方案，稳定贴在全局右下角。",
+			failures,
+		)
+	build_info_overlay.apply_release_info({
+		"version": "1.0.0",
+		"tag": "v1.0.0",
+		"channel": "stable",
+	})
+	checks += _expect(
+		build_info_label != null and build_info_label.text == "v1.0.0",
+		"正式版本只显示版本号，不得继续显示测试版提示。",
+		failures,
+	)
+	build_info_overlay.queue_free()
 
 	startup.free()
 	_prepare_project_shutdown()

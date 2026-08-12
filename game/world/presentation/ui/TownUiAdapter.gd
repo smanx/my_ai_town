@@ -960,8 +960,8 @@ func _on_runtime_avatar_mode_changed(
 	_previous_mode: String,
 ) -> void:
 	_refresh_scope("avatar", true)
-	_refresh_scope("town_hud", true)
-	_refresh_scope("pause_menu", true)
+	_queue_world_scope_refresh("town_hud")
+	_queue_world_scope_refresh("pause_menu")
 
 
 func _on_runtime_observed_place_changed(_result: Dictionary) -> void:
@@ -969,7 +969,7 @@ func _on_runtime_observed_place_changed(_result: Dictionary) -> void:
 	# World has already published its place revision. Refresh the runtime-owned
 	# UI scopes again from the completed visual state.
 	_refresh_scope("avatar", true)
-	_refresh_scope("town_hud", true)
+	_queue_world_scope_refresh("town_hud")
 
 
 func _connect_hud_activity_signals() -> void:
@@ -1038,7 +1038,10 @@ func _on_conversation_changed(
 	)
 	_capture_current_hud_far_conversations()
 	_refresh_scope("conversation", true)
-	_refresh_scope("town_hud", true)
+	# The conversation page now owns the visible frame. Preserve the HUD bubble
+	# state above, then rebuild the covered Town HUD through the existing
+	# frame-spread queue instead of extending the click's synchronous call stack.
+	_queue_world_scope_refresh("town_hud")
 
 
 func _capture_player_conversation_end(
@@ -1071,7 +1074,7 @@ func _on_simulation_speed_changed(_speed: int, world_revision: int) -> void:
 	if world_revision < _world_revision:
 		return
 	_world_revision = world_revision
-	_refresh_scope("town_hud", true)
+	_queue_world_scope_refresh("town_hud")
 
 
 func _on_resident_action_phase_changed(
@@ -1128,13 +1131,23 @@ func _on_hud_resident_reaction_created(
 	var source_action_id := String(
 		reaction.get("sourceActionId", "")
 	).strip_edges()
+	var source_event_id := String(
+		reaction.get("sourceEventId", "")
+	).strip_edges()
+	var reaction_kind := String(
+		reaction.get("reactionKind", "action_result"),
+	).strip_edges()
+	var announcement_id := String(
+		reaction.get("announcementId", ""),
+	).strip_edges()
+	var source_id := source_event_id if not source_event_id.is_empty() else source_action_id
 	var public_thought := _hud_public_thought_text(
 		String(reaction.get("text", ""))
 	)
 	if (
 		resident_id.is_empty()
 		or reaction_id.is_empty()
-		or source_action_id.is_empty()
+		or source_id.is_empty()
 		or public_thought.is_empty()
 	):
 		return
@@ -1147,11 +1160,16 @@ func _on_hud_resident_reaction_created(
 		return
 	_hud_public_thoughts[snapshot_key] = {
 		"previewId": reaction_id,
-		"actionId": source_action_id,
+		"actionId": source_id,
 		"residentId": resident_id,
 		"residentName": resident_name,
 		"publicThought": public_thought,
-		"thoughtKind": "activity_reaction",
+		"thoughtKind": (
+			"announcement_reaction"
+			if reaction_kind == "announcement"
+			else "activity_reaction"
+		),
+		"announcementId": announcement_id,
 		"confirmedRevision": confirmed_revision,
 		"startedAtMsec": now_msec,
 		"expiresAtMsec": (
@@ -2390,6 +2408,17 @@ func _build_town_hud_view_model(operation: Dictionary, error: Dictionary) -> Dic
 	var resident_directory := _hud_resident_directory(runtime_state)
 	var place_directory := _hud_place_directory(runtime_state)
 	var event_overlay := _hud_event_overlay(announcements)
+	var event_overlay_items := event_overlay.get("items", []) as Array
+	var latest_event_payload := {}
+	if not event_overlay_items.is_empty():
+		var latest_event := event_overlay_items[event_overlay_items.size() - 1] as Dictionary
+		var latest_announcement_id := String(
+			latest_event.get("eventId", ""),
+		).strip_edges()
+		if not latest_announcement_id.is_empty():
+			latest_event_payload = {
+				"threadId": "announcement:%s" % latest_announcement_id,
+			}
 	var offscreen_activity := _hud_offscreen_activity_disabled()
 	var far_resident_activity := _hud_far_resident_activity(runtime_state, started)
 	var view_mode := str(runtime_state.get("viewMode", "unavailable"))
@@ -2423,8 +2452,7 @@ func _build_town_hud_view_model(operation: Dictionary, error: Dictionary) -> Dic
 	var can_open_event := (
 		started
 		and bool(event_overlay.get("visible", false))
-		and _runtime != null
-		and _runtime.has_method("open_announcement_panel")
+		and _ui_route_host != null
 	)
 	var can_open_formal_page := started and _ui_route_host != null
 	var can_toggle_avatar := (
@@ -2659,7 +2687,12 @@ func _build_town_hud_view_model(operation: Dictionary, error: Dictionary) -> Dic
 				can_open_formal_page and not active_interior_id.is_empty(),
 				"NO_ACTIVE_INTERIOR",
 			),
-			"openEvent": _action("town_hud.open_event", can_open_event, "NO_EVENT"),
+			"openEvent": _action(
+				"town_hud.open_town_log",
+				can_open_event,
+				"NO_EVENT",
+				latest_event_payload,
+			),
 		},
 		operation,
 		error,
@@ -2901,7 +2934,7 @@ func _hud_public_thought_item(
 		"importance": "normal",
 		"displayRank": (
 			0
-			if thought_kind == "activity_reaction"
+			if thought_kind in ["activity_reaction", "announcement_reaction"]
 			else (1 if thought_kind == "action_intention" else 10)
 		),
 		"playbackIdentity": "%s|%s|%s" % [
@@ -2915,13 +2948,25 @@ func _hud_public_thought_item(
 		"spaceId": space_id,
 		"indoor": space_id != "town_outdoor",
 		"action": _action(
-			"town_hud.open_resident_action",
+			(
+				"town_hud.open_town_log"
+				if thought_kind == "announcement_reaction"
+				else "town_hud.open_resident_action"
+			),
 			_ui_route_host != null,
 			"TOWN_UI_ROUTE_HOST_NOT_CONNECTED",
-			{
-				"residentId": resident_id,
-				"residentName": resident_name,
-			},
+			(
+				{
+					"threadId": "announcement:%s" % String(
+						presentation.get("announcementId", ""),
+					),
+				}
+				if thought_kind == "announcement_reaction"
+				else {
+					"residentId": resident_id,
+					"residentName": resident_name,
+				}
+			),
 		),
 	}
 	for field: String in [
@@ -2930,6 +2975,7 @@ func _hud_public_thought_item(
 		"waitReason",
 		"sourceActivityId",
 		"visibleSpaceId",
+		"announcementId",
 	]:
 		if presentation.has(field):
 			item[field] = presentation[field]
@@ -3829,7 +3875,11 @@ func _hud_resident_directory(runtime_state: Dictionary) -> Dictionary:
 		if location_label.is_empty():
 			location_label = String(state.get("spaceId", "")).strip_edges()
 		var behavior_label := String(state.get("doing", "")).strip_edges()
-		var portrait_texture := _resident_portrait_texture(resident_id)
+		# ResidentDirectoryDrawer 默认收起。头像资源只在玩家打开目录时加载，
+		# 避免首个 HUD 刷新同步读取 15 张图片，阻塞正常游玩帧。
+		var portrait_texture: Texture2D = null
+		if _resident_portraits_loaded:
+			portrait_texture = _resident_portrait_texture(resident_id)
 		items.append({
 			"residentId": resident_id,
 			"residentName": resident_name,
@@ -4059,10 +4109,19 @@ func _hud_event_overlay(announcements: Dictionary) -> Dictionary:
 		if not (value is Dictionary):
 			continue
 		var announcement := value as Dictionary
+		var schedule_label := String(
+			announcement.get("scheduleLabel", ""),
+		).strip_edges()
+		var schedule_status := String(
+			announcement.get("scheduleStatus", ""),
+		).strip_edges()
+		var summary := str(announcement.get("text", ""))
+		if not schedule_label.is_empty():
+			summary += "\n%s · %s" % [schedule_label, schedule_status]
 		items.append({
 			"eventId": str(announcement.get("announcement_id", "")),
 			"title": str(announcement.get("text", "")),
-			"summary": str(announcement.get("text", "")),
+			"summary": summary,
 			"direction": "",
 			"screenAnchor": {},
 			"targetId": "",
@@ -4461,8 +4520,9 @@ func _execute_conversation_intent(intent: String, payload: Dictionary) -> Dictio
 		"conversation.retry":
 			_conversation_network_error.clear()
 			_conversation_wait_started_msec = Time.get_ticks_msec()
-			if _gateway != null and _gateway.has_method("pump"):
-				_gateway.call("pump")
+			# TownRuntime already drains one Agent request per frame. Let the next
+			# frame pick up this retry instead of synchronously draining every
+			# queued resident request from the button callback.
 			_refresh_scope("conversation", true)
 			return _success_result()
 		"conversation.spectator.select":
@@ -4508,6 +4568,12 @@ func _execute_avatar_intent(intent: String, payload: Dictionary) -> Dictionary:
 
 func _execute_town_hud_intent(intent: String, payload: Dictionary) -> Dictionary:
 	match intent:
+		"town_hud.ensure_resident_directory_portraits":
+			_ensure_resident_portraits_loaded()
+			_hud_resident_directory_signature.clear()
+			_hud_resident_directory_cache.clear()
+			_refresh_scope("town_hud", true)
+			return _success_result()
 		"town_hud.toggle_avatar":
 			return _toggle_hud_avatar_mode()
 		"town_hud.set_time_speed":
@@ -4845,7 +4911,11 @@ func _complete_operation(scope: String, operation: Dictionary, result: Dictionar
 		var result_revision := int(result.get("worldRevision", _read_world_revision()))
 		if result_revision >= _world_revision:
 			_world_revision = result_revision
-			_refresh_world_scopes()
+			# The operation state above is the only response the clicked page needs
+			# synchronously. Rebuild authoritative world projections one at a time
+			# on following frames so a single click cannot rebuild all six scopes.
+			for world_scope in WORLD_SCOPES:
+				_queue_world_scope_refresh(world_scope)
 	operation_completed.emit(scope, final_operation.duplicate(true))
 
 
@@ -4946,23 +5016,32 @@ func _normalize_town_hud_playback_times(view_model: Dictionary) -> void:
 # 播放时间 / confirmedRevision / 坐标残留;剔除清单与 far 层
 # _stable_overlay_section 对齐。只用于 emit 判定,payload 不受影响。
 func _town_hud_stable_projection(view_model: Dictionary) -> Dictionary:
-	var projection := view_model.duplicate(true)
+	# town_hud 的稳定投影只用于比较是否需要广播。这里不能再对整棵
+	# ViewModel 做深拷贝：居民目录、地点目录和 HUD 条目包含大量嵌套
+	# 字典，单纯为了去掉几个播放时间字段就会把这段比较推到毫秒级。
+	# 其余字段保持只读引用，只有会被清理的 scope 和 item 做浅复制。
+	var projection := view_model.duplicate(false)
 	projection.erase("revision")
-	var data := projection.get("data", {}) as Dictionary
+	var source_data := view_model.get("data", {}) as Dictionary
+	var data := source_data.duplicate(false)
+	projection["data"] = data
 	for section_key: String in [
 		"residentOverlays",
 		"farResidentActivity",
 		"offscreenActivity",
 	]:
-		var section := data.get(section_key, {}) as Dictionary
+		var source_section := source_data.get(section_key, {}) as Dictionary
+		var section := source_section.duplicate(false)
 		section.erase("revision")
 		section.erase("confirmedRevision")
 		# 累计诊断计数不驱动广播:候选被丢弃已由 items 差异触发 emit。
 		section.erase("missingResidentStateCount")
-		for value: Variant in section.get("items", []) as Array:
+		var stable_items: Array = []
+		for value: Variant in source_section.get("items", []) as Array:
 			if typeof(value) != TYPE_DICTIONARY:
+				stable_items.append(value)
 				continue
-			var item := value as Dictionary
+			var item := (value as Dictionary).duplicate(false)
 			for field: String in [
 				"screenAnchor",
 				"headScreenAnchor",
@@ -4971,6 +5050,9 @@ func _town_hud_stable_projection(view_model: Dictionary) -> Dictionary:
 				"confirmedRevision",
 			]:
 				item.erase(field)
+			stable_items.append(item)
+		section["items"] = stable_items
+		data[section_key] = section
 	return projection
 
 

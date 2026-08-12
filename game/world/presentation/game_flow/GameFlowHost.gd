@@ -80,6 +80,9 @@ const BOOTSTRAP := preload("res://world/presentation/session/TownSessionBootstra
 const TOWN_ENTRY_LOADING_OVERLAY := preload(
 	"res://ui/startup/TownEntryLoadingOverlay.gd"
 )
+const GAME_BUILD_INFO_OVERLAY := preload(
+	"res://ui/common/GameBuildInfoOverlay.gd"
+)
 const REPLACEMENT_ARRIVAL_PANEL := preload(
 	"res://ui/resident_admission/ReplacementResidentArrivalPanel.gd"
 )
@@ -124,6 +127,11 @@ const FORMAL_RUNTIME_AUDIT_ENV := "AI_TOWN_FORMAL_RUNTIME_AUDIT_PATH"
 const DAILY_AUTO_SAVE_REASON := "daily_auto_save"
 const DAILY_AUTO_SAVE_RETRY_INTERVAL_MSEC := 5000
 const DAILY_AUTO_SAVE_ERROR_HISTORY_LIMIT := 32
+# 居民留言是可选彩蛋，不能阻塞返回主菜单或退出游戏。
+const QUIT_DEPARTURE_MESSAGES_TIMEOUT_SECONDS := 3.0
+# 退出留言只是可选内容，不能让玩家长时间停在全屏等待页。
+# 正式 Provider 最长配置为 300 秒；额外留出结算余量，只处理回调契约失效。
+const REPLACEMENT_PERSONA_TIMEOUT_SECONDS := 310.0
 const REPLACEMENT_AGENT_ATTRIBUTE_FIELDS: Array[String] = [
 	"name",
 	"gender",
@@ -206,6 +214,7 @@ var _resident_model_assignment_service: RESIDENT_MODEL_ASSIGNMENT_SERVICE
 var _resident_model_assignment_committing := false
 var _resident_model_assignment_preserved_draft: Dictionary = {}
 var _town_entry_loading_overlay: CanvasLayer
+var _game_build_info_overlay: GameBuildInfoOverlay
 var _town_entry_loading_generation := -1
 var _town_entry_loading_route_kind := ""
 var _town_entry_loading_owner := ""
@@ -226,11 +235,14 @@ var _town_ui_route := &"town"
 var _pause_open := false
 var _pause_focus_return_path := NodePath()
 var _pause_return_deferred := false
+var _pause_route_open_pending := false
+var _pause_route_open_sequence := 0
 var _in_session_load_pending := false
 var _process_quit_scheduled := false
 var _quit_departure_pending := false
 var _quit_departure_id := ""
 var _quit_execute_process := true
+var _return_to_start_after_departure := false
 var _flow_generation := 1
 var _startup_view_model_revision := 0
 var _last_result: Dictionary = {}
@@ -243,6 +255,8 @@ var _daily_auto_save_last_attempt_msec := -100000
 var _daily_auto_save_attempts := 0
 var _daily_auto_save_successes := 0
 var _replacement_generation_pending := false
+var _replacement_generation_sequence := 0
+var _active_replacement_generation_id := 0
 var _replacement_last_checked_minute := -1
 var _pending_replacement_candidate: Dictionary = {}
 var _replacement_arrival_panel: ReplacementResidentArrivalPanel
@@ -271,12 +285,24 @@ func _ready() -> void:
 	_audio_display_settings_service = AUDIO_DISPLAY_SETTINGS_SERVICE.new()
 	_audio_display_settings_service.name = "TownAudioDisplaySettingsService"
 	add_child(_audio_display_settings_service)
+	_ensure_game_build_info_overlay()
 	_initialize_startup_settings_services()
 	_apply_window_mode_marker()
 	_formal_runtime_audit_requested = not OS.get_environment(
 		FORMAL_RUNTIME_AUDIT_ENV
 	).strip_edges().is_empty()
 	_bind_current_scene.call_deferred()
+
+
+func _ensure_game_build_info_overlay() -> void:
+	if (
+		is_instance_valid(_game_build_info_overlay)
+		or GAME_BUILD_INFO_OVERLAY.load_release_info().is_empty()
+	):
+		return
+	_game_build_info_overlay = GAME_BUILD_INFO_OVERLAY.new() as GameBuildInfoOverlay
+	_game_build_info_overlay.name = "GameBuildInfoOverlay"
+	add_child(_game_build_info_overlay)
 
 
 func _notification(what: int) -> void:
@@ -372,7 +398,15 @@ func _begin_replacement_persona_generation(death_event: Dictionary) -> void:
 			_build_replacement_candidate(death_event, source_binding, {}),
 		)
 		return
+	_replacement_generation_sequence += 1
+	var generation_id := _replacement_generation_sequence
+	_active_replacement_generation_id = generation_id
 	_replacement_generation_pending = true
+	_schedule_replacement_persona_timeout(
+		generation_id,
+		death_event,
+		source_binding,
+	)
 	provider.request_json({
 		"request_kind": "replacement_resident_persona",
 		"messages": [{
@@ -388,6 +422,7 @@ func _begin_replacement_persona_generation(death_event: Dictionary) -> void:
 		}],
 		"max_tokens": 360,
 	}, _on_replacement_persona_generated.bind(
+		generation_id,
 		death_event.duplicate(true),
 		source_binding.duplicate(true),
 	))
@@ -395,15 +430,61 @@ func _begin_replacement_persona_generation(death_event: Dictionary) -> void:
 
 func _on_replacement_persona_generated(
 	result: Dictionary,
+	generation_id: int,
 	death_event: Dictionary,
 	source_binding: Dictionary,
 ) -> void:
+	if (
+		not _replacement_generation_pending
+		or generation_id != _active_replacement_generation_id
+	):
+		return
 	_replacement_generation_pending = false
+	_active_replacement_generation_id = 0
 	var persona: Dictionary = {}
 	if bool(result.get("ok", false)) and result.get("json", {}) is Dictionary:
 		persona = (result.get("json", {}) as Dictionary).duplicate(true)
 	_present_generated_replacement(
 		_build_replacement_candidate(death_event, source_binding, persona),
+	)
+
+
+func _schedule_replacement_persona_timeout(
+	generation_id: int,
+	death_event: Dictionary,
+	source_binding: Dictionary,
+) -> void:
+	if not is_inside_tree():
+		return
+	get_tree().create_timer(
+		REPLACEMENT_PERSONA_TIMEOUT_SECONDS,
+		true,
+		false,
+		true,
+	).timeout.connect(
+		_on_replacement_persona_timeout.bind(
+			generation_id,
+			death_event.duplicate(true),
+			source_binding.duplicate(true),
+		),
+		CONNECT_ONE_SHOT,
+	)
+
+
+func _on_replacement_persona_timeout(
+	generation_id: int,
+	death_event: Dictionary,
+	source_binding: Dictionary,
+) -> void:
+	if (
+		not _replacement_generation_pending
+		or generation_id != _active_replacement_generation_id
+	):
+		return
+	_replacement_generation_pending = false
+	_active_replacement_generation_id = 0
+	_present_generated_replacement(
+		_build_replacement_candidate(death_event, source_binding, {}),
 	)
 
 
@@ -1334,18 +1415,41 @@ func get_daily_auto_save_diagnostics() -> Dictionary:
 
 
 func request_return_to_start() -> Dictionary:
-	var departure := _prepare_session_departure()
+	if _quit_departure_pending:
+		return {
+			"ok": true,
+			"errorCode": "",
+			"retryable": false,
+			"pending": true,
+			"departureId": _quit_departure_id,
+		}
+	_return_to_start_after_departure = true
+	var departure := request_quit_game(false)
 	if not bool(departure.get("ok", false)):
-		_last_result = departure.duplicate(true)
+		_return_to_start_after_departure = false
 		return departure
+	# 没有正式城镇运行时，request_quit_game 会同步完成保存，不经过
+	# _continue_quit_after_optional_messages；这里仍要完成返回主菜单。
+	if (
+		not bool(departure.get("pending", false))
+		and _return_to_start_after_departure
+	):
+		_return_to_start_after_departure = false
+		return _route_to_start_after_departure(departure)
+	return departure
+
+
+func _route_to_start_after_departure(departure: Dictionary) -> Dictionary:
 	var startup_scene := load(STARTUP_SCENE_PATH) as PackedScene
 	if startup_scene == null:
+		_dismiss_town_entry_loading()
 		return _record_route_open_failure(
 			"GAME_FLOW_STARTUP_ROUTE_FAILED",
 			"启动页面暂时打不开，请稍后再试。",
 		)
 	var route_error := get_tree().change_scene_to_packed(startup_scene)
 	if route_error != OK:
+		_dismiss_town_entry_loading()
 		return _present_route_failure_result(
 			_failure("GAME_FLOW_STARTUP_ROUTE_FAILED", false, [{
 				"godotError": route_error,
@@ -1409,6 +1513,7 @@ func request_quit_game(execute_process_quit := true) -> Dictionary:
 		)
 	if _quit_departure_id.is_empty():
 		_quit_departure_id = "departure-%d" % Time.get_ticks_usec()
+	var departure_id := _quit_departure_id
 	_quit_departure_pending = true
 	_quit_execute_process = execute_process_quit
 	_begin_town_entry_loading("quit_game")
@@ -1417,19 +1522,22 @@ func request_quit_game(execute_process_quit := true) -> Dictionary:
 		"prepare_departure_messages",
 		_quit_departure_id,
 		2,
-		Callable(self, "_on_quit_departure_messages_ready"),
+		Callable(self, "_on_quit_departure_messages_ready").bind(
+			departure_id,
+		),
 	) as Dictionary
 	if not bool(started.get("ok", false)):
 		return _continue_quit_after_optional_messages(
 			[],
 			execute_process_quit,
 		)
+	_schedule_quit_departure_messages_timeout(departure_id)
 	return {
 		"ok": true,
 		"errorCode": "",
 		"retryable": false,
 		"pending": _quit_departure_pending,
-		"departureId": _quit_departure_id,
+		"departureId": departure_id,
 		"quitRequested": true,
 		"processQuitExecuted": (
 			not _quit_departure_pending and execute_process_quit
@@ -1437,8 +1545,41 @@ func request_quit_game(execute_process_quit := true) -> Dictionary:
 	}
 
 
-func _on_quit_departure_messages_ready(result: Dictionary) -> void:
-	if not _quit_departure_pending:
+func _schedule_quit_departure_messages_timeout(departure_id: String) -> void:
+	if (
+		not is_inside_tree()
+		or not _quit_departure_pending
+		or departure_id != _quit_departure_id
+	):
+		return
+	get_tree().create_timer(
+		QUIT_DEPARTURE_MESSAGES_TIMEOUT_SECONDS,
+		true,
+		false,
+		true,
+	).timeout.connect(
+		_on_quit_departure_messages_timeout.bind(departure_id),
+		CONNECT_ONE_SHOT,
+	)
+
+
+func _on_quit_departure_messages_timeout(departure_id: String) -> void:
+	if (
+		not _quit_departure_pending
+		or departure_id != _quit_departure_id
+	):
+		return
+	_continue_quit_after_optional_messages([], _quit_execute_process)
+
+
+func _on_quit_departure_messages_ready(
+	result: Dictionary,
+	departure_id: String,
+) -> void:
+	if (
+		not _quit_departure_pending
+		or departure_id != _quit_departure_id
+	):
 		return
 	if not bool(result.get("ok", false)):
 		_continue_quit_after_optional_messages(
@@ -1472,16 +1613,24 @@ func _continue_quit_after_optional_messages(
 	)
 	_last_result = departure.duplicate(true)
 	_quit_departure_pending = false
+	_quit_departure_id = ""
+	var return_to_start := _return_to_start_after_departure
+	_return_to_start_after_departure = false
 	if not bool(departure.get("ok", false)):
 		_dismiss_town_entry_loading()
 		call_deferred(
 			"_present_pause_departure_failure",
-			"pause_menu.quit_game",
+			(
+				"pause_menu.return_to_start"
+				if return_to_start
+				else "pause_menu.quit_game"
+			),
 			departure.duplicate(true),
 		)
 		return departure
 	_advance_town_entry_loading(1.0, "保存成功")
-	_quit_departure_id = ""
+	if return_to_start:
+		return _route_to_start_after_departure(departure)
 	if _quit_execute_process:
 		_prepare_audio_shutdown()
 		_schedule_process_quit()
@@ -1535,6 +1684,8 @@ func _unmount_town_overlays() -> void:
 	_avatar_hud = null
 	_town_ui_route = &"town"
 	_pause_open = false
+	_pause_route_open_sequence += 1
+	_pause_route_open_pending = false
 
 
 func _release_internal_session_refs() -> void:
@@ -1558,7 +1709,9 @@ func _release_internal_session_refs() -> void:
 	_daily_auto_save_last_revision = 0
 	_daily_auto_save_failures.clear()
 	_daily_auto_save_inflight = false
+	_replacement_generation_sequence += 1
 	_replacement_generation_pending = false
+	_active_replacement_generation_id = 0
 	_replacement_last_checked_minute = -1
 	_replacement_world_admitted = false
 	_pending_replacement_candidate.clear()
@@ -1572,6 +1725,7 @@ func _release_internal_session_refs() -> void:
 	_resident_selection_vm.clear()
 	_quit_departure_pending = false
 	_quit_departure_id = ""
+	_return_to_start_after_departure = false
 
 
 func _bind_current_scene() -> void:
@@ -5185,6 +5339,8 @@ func _open_pause_menu() -> void:
 	_town_runtime.call("set_main_menu_open", true)
 	_pause_host.show()
 	_pause_open = true
+	_pause_route_open_sequence += 1
+	_pause_route_open_pending = false
 	_sync_town_runtime_input_gates()
 
 
@@ -5196,6 +5352,8 @@ func _close_pause_menu() -> void:
 	_town_runtime.call("set_main_menu_open", false)
 	_pause_host.hide()
 	_pause_open = false
+	_pause_route_open_sequence += 1
+	_pause_route_open_pending = false
 	get_viewport().gui_release_focus()
 	_sync_town_runtime_input_gates()
 	call_deferred("_restore_pause_focus", focus_return_path)
@@ -5241,34 +5399,64 @@ func _on_pause_intent_requested(intent: StringName, payload: Dictionary) -> void
 					quit_result.duplicate(true),
 				)
 		"pause_menu.open_llm_settings":
-			if is_instance_valid(_town_ui_host):
-				_pause_host.hide()
-				var settings_opened := _town_ui_host.call(
-					"open_page",
-					&"provider_settings",
-				) as Dictionary
-				if not bool(settings_opened.get("ok", false)):
-					_pause_host.show()
-					if _pause_host.has_method("present_host_result"):
-						_pause_host.call(
-							"present_host_result",
-							"pause_menu.open_llm_settings",
-							settings_opened,
-						)
+			_queue_pause_town_page_open(
+				&"pause_menu.open_llm_settings",
+				&"provider_settings",
+				{},
+			)
 		"pause_menu.open_resident_models":
-			if is_instance_valid(_town_ui_host):
-				_pause_host.hide()
-				var assignment_opened := _town_ui_host.open_page(
-					&"resident_model_assignment",
-					{"mode": "in_session"},
-				) as Dictionary
-				if not bool(assignment_opened.get("ok", false)):
-					_pause_host.show()
-					if _pause_host.has_method("present_host_result"):
-						_pause_host.present_host_result(
-							"pause_menu.open_resident_models",
-							assignment_opened,
-						)
+			_queue_pause_town_page_open(
+				&"pause_menu.open_resident_models",
+				&"resident_model_assignment",
+				{"mode": "in_session"},
+			)
+
+
+func _queue_pause_town_page_open(
+	intent: StringName,
+	route: StringName,
+	payload: Dictionary,
+) -> void:
+	if (
+		_pause_route_open_pending
+		or not _pause_open
+		or not is_instance_valid(_pause_host)
+		or not is_instance_valid(_town_ui_host)
+	):
+		return
+	_pause_route_open_pending = true
+	_pause_route_open_sequence += 1
+	var request_sequence := _pause_route_open_sequence
+	var flow_generation := _flow_generation
+	# The pause screen is already a complete, rendered page. Preserve it for the
+	# click frame, then build the requested page; duplicate clicks share this one
+	# bounded pending transition.
+	if DisplayServer.get_name() == "headless":
+		await get_tree().process_frame
+	else:
+		await RenderingServer.frame_post_draw
+	if (
+		request_sequence != _pause_route_open_sequence
+		or flow_generation != _flow_generation
+		or not _pause_open
+		or not is_instance_valid(_pause_host)
+		or not is_instance_valid(_town_ui_host)
+	):
+		_pause_route_open_pending = false
+		return
+	var opened := _town_ui_host.open_page(
+		route,
+		payload.duplicate(true),
+	) as Dictionary
+	_pause_route_open_pending = false
+	if not bool(opened.get("ok", false)):
+		if _pause_host.has_method("present_host_result"):
+			_pause_host.present_host_result(
+				String(intent),
+				opened,
+			)
+		return
+	_pause_host.hide()
 
 
 func _open_in_session_load_game() -> void:

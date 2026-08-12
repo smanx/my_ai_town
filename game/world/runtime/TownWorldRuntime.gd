@@ -43,11 +43,19 @@ const CHARACTER_MOVEMENT_QUERY := preload(
 const MOVEMENT_CLEARANCE_RUNTIME := preload(
 	"res://world/runtime/TownMovementClearanceRuntime.gd"
 )
+const RESIDENT_ARRIVAL_RUNTIME := preload("res://world/runtime/TownResidentArrivalRuntime.gd")
 const AGENT_WAKE_STATE_RUNTIME := preload(
 	"res://world/runtime/TownAgentWakeStateRuntime.gd"
 )
 const WORLD_PERFORMANCE_PROBE := preload(
 	"res://world/runtime/TownWorldPerformanceProbe.gd"
+)
+const ACTIVITY_OPTION_QUERY := preload(
+	"res://world/runtime/activity/TownActivityOptionQuery.gd"
+)
+const ACTIVITY_REACHABILITY_CACHE := preload("res://world/runtime/activity/TownActivityReachabilityCache.gd")
+const FRAME_BUDGET_RUNTIME := preload(
+	"res://world/runtime/presentation/TownWorldFrameBudgetRuntime.gd"
 )
 const WORK_ACTOR_SELECTION_POLICY := preload(
 	"res://world/runtime/work/TownWorkActorSelectionPolicy.gd"
@@ -130,6 +138,10 @@ const SOCIAL_MATTER_RUNTIME := preload(
 const COMMUNITY_BULLETIN_RUNTIME := preload(
 	"res://world/runtime/social/TownCommunityBulletinRuntime.gd"
 )
+const ANNOUNCEMENT_TIME_PARSER := preload(
+	"res://world/runtime/social/TownAnnouncementTimeParser.gd"
+)
+const ANNOUNCEMENT_RESIDENT_RUNTIME := preload("res://world/runtime/social/TownAnnouncementResidentRuntime.gd")
 const SOCIAL_MATTER_SOURCE_ADAPTER := preload(
 	"res://world/runtime/social/TownSocialMatterSourceAdapter.gd"
 )
@@ -224,6 +236,7 @@ const AUTONOMOUS_CONVERSATION_IDLE_TIMEOUT_SECONDS := 45.0
 const RESIDENT_CONVERSATION_PAIR_COOLDOWN_MINUTES := 30
 const MAX_ENDED_CONVERSATION_HISTORY := 64
 const MAX_ANNOUNCEMENT_HISTORY := 64
+const MAX_AGENT_KNOWN_ANNOUNCEMENTS := 12
 const MAX_DELIVERED_PRIVATE_MESSAGES := 64
 const MAX_SELF_CARRIED_CARGO_QUANTITY := 2
 const PERCEPTION_EXIT_HYSTERESIS_PX := 48.0
@@ -264,6 +277,7 @@ const STAFFING_MATTER_REFRESH_INTERVAL_MINUTES := 1440
 const NEW_GAME_ARRIVAL_END_MINUTE_OF_DAY := 719
 const MAX_LIFE_DESTINATION_OPTIONS := 8
 const MAX_LIFE_ACTIVITIES_PER_DESTINATION := 3
+const MAX_AGENT_ACTIVITY_ROUTE_CHECKS_PER_WAKE := 1
 const NATURAL_LIFE_ACTIVITY_IDS := [
 	"activity_cafe_eat_pastry",
 	"activity_cafe_order",
@@ -365,9 +379,15 @@ var _observed_action_preview_resident_id := ""
 # 每分钟整表失效。攻击唤醒包会对多名居民重复做相同目标的
 # 寻路可达性检查，缓存把这部分 A* 开销压掉。
 var _activity_reachability_cache: Dictionary = {}
+var _activity_prepared_action_cache: Dictionary = {}
 var _activity_reachability_cache_minute := -1
 var perception_spatial := PERCEPTION_RUNTIME.SpatialState.new()
 var _processing_tick_absolute_minute := -1
+var _deferred_resident_state_refreshes: Array[String] = []
+var _deferred_resident_state_refresh_keys: Dictionary = {}
+var _deferred_resident_place_change_signals: Array[Dictionary] = []
+var _perception_refresh_deferred := false
+var _perception_deferred_advance_count := 0
 var _public_social_matter_activity_cache: Dictionary = {}
 var _public_social_matter_activity_cache_revision := -1
 var _staffing_matter_sync_signature: Array = []
@@ -691,6 +711,7 @@ func _start_with_validation(
 	_resident_sleep = prepared_resident_sleep
 	_clinic_interviews = CLINIC_INTERVIEW_POLICY.new()
 	_pause_reasons.clear()
+	_reset_deferred_frame_work()
 	var speed_was_reset := _simulation_speed != 1
 	_simulation_speed = 1
 	_runtime_generation += 1
@@ -1002,6 +1023,7 @@ func apply_indoor_layout_projection(projection: Dictionary) -> Dictionary:
 	_world_data = next_data
 	_place_by_name_cache.clear()
 	_presentation_cue_cache.clear()
+	ACTIVITY_REACHABILITY_CACHE.clear(self)
 	var baseline := INDOOR_LAYOUT_PROJECTION.snapshot_for_space(
 		_base_world_data,
 		space_id,
@@ -1060,6 +1082,7 @@ func stop() -> Dictionary:
 	_invalidate_all_pending_decisions()
 	_world_log_capture_enabled = false
 	_pause_reasons.clear()
+	_reset_deferred_frame_work()
 	_observed_action_preview_resident_id = ""
 	_tick_weather_override = ""
 	_dynamic_props.clear()
@@ -1716,68 +1739,9 @@ func restore_from_snapshot(
 		abort_restore_candidate(token)
 	return result
 
-const RESIDENT_ARRIVAL_RUNTIME := preload("res://world/runtime/TownResidentArrivalRuntime.gd")
 func _advance_resident_arrivals(absolute_minute: int) -> void:
-	var arrived_resident_ids: Array[String] = []
-	for resident_id in _resident_order:
-		var resident := _residents.get(resident_id, {}) as Dictionary
-		var arrival := resident.get("arrivalState", {}) as Dictionary
-		if (
-			String(arrival.get("status", "arrived")) != "pending"
-			or absolute_minute
-				< int(arrival.get("scheduledAbsoluteMinute", 2_147_483_647))
-		):
-			continue
-		var entry_state := _arrival_entry_state_for(resident_id)
-		if not entry_state.is_empty():
-			resident["position"] = entry_state.get(
-				"position",
-				resident.get("position", Vector2.ZERO),
-			)
-			resident["spaceId"] = String(
-				entry_state.get("spaceId", resident.get("spaceId", "")),
-			)
-			resident["regionId"] = String(
-				entry_state.get("regionId", resident.get("regionId", "")),
-			)
-			resident["currentPlace"] = String(
-				entry_state.get(
-					"placeName",
-					resident.get("currentPlace", ""),
-				),
-			)
-		arrival["status"] = "arrived"
-		arrival["arrivedAbsoluteMinute"] = absolute_minute
-		resident["arrivalState"] = arrival
-		RESIDENT_ARRIVAL_RUNTIME.activate_entry_continuity(self, resident_id, resident, absolute_minute)
-		resident["movementRevision"] = (
-			int(resident.get("movementRevision", 1)) + 1
-		)
-		arrived_resident_ids.append(resident_id)
-		_append_world_log_event(
-			_next_world_event_id(),
-			"resident_lifecycle",
-			resident_id,
-			_resident_display_name(resident_id),
-			String(resident.get("currentPlace", "")),
-			{
-				"type": "居民抵达",
-				"lifecycleId": "resident-arrival:%s" % resident_id,
-				"status": "completed",
-				"participantIds": [resident_id],
-				"arrivedAbsoluteMinute": absolute_minute,
-			},
-		)
-		_emit_resident_state_changed(resident_id)
-		_schedule_decision(resident_id, false, false, false, false, true)
-	if arrived_resident_ids.is_empty():
-		return
-	_refresh_place_service_staffing()
-	_sync_production_tasks(absolute_minute)
-func _arrival_entry_state_for(resident_id: String) -> Dictionary:
-	return RESIDENT_ARRIVAL_RUNTIME.entry_state_for(
-		self,
-		resident_id,
+	RESIDENT_ARRIVAL_RUNTIME.advance(
+		self, absolute_minute,
 		IDLE_RESIDENT_CLEARANCE_PX,
 	)
 
@@ -1794,6 +1758,36 @@ func _advance_profile_count(key: String, amount: int) -> void:
 		_advance_profile_scratch[key] = (
 			int(_advance_profile_scratch.get(key, 0)) + amount
 		)
+
+
+func _reset_deferred_frame_work() -> void:
+	FRAME_BUDGET_RUNTIME.reset(self)
+	ACTIVITY_REACHABILITY_CACHE.clear(self)
+
+
+func _finish_advance_profile(advance_started_usec: int) -> void:
+	if not _advance_profile_enabled:
+		return
+	_advance_profile_scratch["totalUsec"] = (
+		Time.get_ticks_usec() - advance_started_usec
+	)
+	_last_advance_profile = _advance_profile_scratch
+
+
+func _defer_perception_refresh() -> void:
+	FRAME_BUDGET_RUNTIME.defer_perception_refresh(self)
+
+
+func _queue_resident_state_refresh(resident_id: String) -> void:
+	FRAME_BUDGET_RUNTIME.queue_resident_state_refresh(self, resident_id)
+
+
+func _queue_resident_place_change_signal(
+	resident_id: String,
+	place_change: Dictionary,
+) -> void:
+	FRAME_BUDGET_RUNTIME.queue_resident_place_change_signal(self, resident_id, place_change)
+
 
 func advance(real_seconds: float) -> Dictionary:
 	var advance_started_usec := (
@@ -1812,7 +1806,17 @@ func advance(real_seconds: float) -> Dictionary:
 			"minutesAdvanced": 0,
 			"events": [],
 		})
-	CONVERSATION_RUNTIME._advance_autonomous_conversation_timeouts(self, real_seconds)
+	var deferred_work := FRAME_BUDGET_RUNTIME.process_deferred_work(
+		self,
+		advance_profile,
+	)
+	var processed_presentation_refreshes := int(deferred_work.get("presentationProcessed", 0))
+	var processed_place_change_signals := int(deferred_work.get("placeProcessed", 0))
+	var processed_deferred_perception := bool(deferred_work.get("perceptionProcessed", false))
+	CONVERSATION_RUNTIME._advance_autonomous_conversation_timeouts(
+		self,
+		real_seconds,
+	)
 	var environment_update := _environment.advance(
 		real_seconds * float(_simulation_speed),
 	) as Dictionary
@@ -1846,6 +1850,7 @@ func advance(real_seconds: float) -> Dictionary:
 		lap_usec = _advance_profile_lap(advance_profile, "occupationPresenceUsec", lap_usec)
 		_advance_social_matters(absolute_minute)
 		lap_usec = _advance_profile_lap(advance_profile, "socialMattersUsec", lap_usec)
+		_advance_announcement_schedules(absolute_minute)
 		_advance_passive_activity_needs(absolute_minute)
 		lap_usec = _advance_profile_lap(advance_profile, "passiveNeedsUsec", lap_usec)
 		if posmod(absolute_minute, 30) == 0:
@@ -1860,7 +1865,7 @@ func advance(real_seconds: float) -> Dictionary:
 			lap_usec = _advance_profile_lap(advance_profile, "staffingMattersUsec", lap_usec)
 			_sync_production_tasks(absolute_minute)
 			lap_usec = _advance_profile_lap(advance_profile, "productionTasksUsec", lap_usec)
-		PERCEPTION_RUNTIME._refresh_perception(self, true)
+		FRAME_BUDGET_RUNTIME.refresh_or_defer_perception(self)
 		lap_usec = _advance_profile_lap(advance_profile, "perceptionUsec", lap_usec)
 		_schedule_life_rhythm_decisions(absolute_minute)
 		lap_usec = _advance_profile_lap(advance_profile, "lifeRhythmUsec", lap_usec)
@@ -1873,11 +1878,7 @@ func advance(real_seconds: float) -> Dictionary:
 		_notify_world_revision()
 		environment_changed.emit(get_time(), get_weather())
 	_advance_confirmed_action_previews(real_seconds)
-	if _advance_profile_enabled:
-		advance_profile["totalUsec"] = (
-			Time.get_ticks_usec() - advance_started_usec
-		)
-		_last_advance_profile = advance_profile
+	_finish_advance_profile(advance_started_usec)
 	# advance 是逐帧热路径：返回值就地构造，不走 _decorate_command_result 的整体深拷贝；
 	# events 多数帧为空，只在非空时拷贝。
 	var advanced_events := environment_update.get("events", []) as Array
@@ -1887,6 +1888,11 @@ func advance(real_seconds: float) -> Dictionary:
 		"simulationSpeed": _simulation_speed,
 		"minutesAdvanced": int(environment_update.get("minutesAdvanced", 0)),
 		"events": advanced_events.duplicate(true) if not advanced_events.is_empty() else [],
+		"deferredPresentationRefreshesProcessed": processed_presentation_refreshes,
+		"deferredPresentationRefreshCount": _deferred_resident_state_refreshes.size(),
+		"deferredPlaceChangeSignalsProcessed": processed_place_change_signals,
+		"deferredPlaceChangeSignalCount": _deferred_resident_place_change_signals.size(),
+		"deferredPerceptionProcessed": processed_deferred_perception,
 		"errorCode": "",
 		"retryable": false,
 		"worldRevision": _world_revision,
@@ -1928,6 +1934,7 @@ func cycle_time_period_for_test() -> Dictionary:
 		_advance_actions(absolute_minute)
 		_advance_resident_conditions(absolute_minute)
 		_advance_social_matters(absolute_minute)
+		_advance_announcement_schedules(absolute_minute)
 		_advance_passive_activity_needs(absolute_minute)
 		PERCEPTION_RUNTIME._refresh_perception(self, true)
 		_schedule_life_rhythm_decisions(absolute_minute)
@@ -5324,160 +5331,16 @@ func get_resident_public_relationship_progress(
 func query_activity_options(
 	resident_id: String,
 	resident_override: Dictionary = {},
+	max_uncached_reachability_checks := -1,
+	priority_activity_id := "",
 ) -> Dictionary:
-	if not _running:
-		return _command_failure("WORLD_NOT_RUNNING", ["世界尚未运行"])
-	var normalized_id := resident_id.strip_edges()
-	if normalized_id.is_empty() or not _residents.has(normalized_id):
-		return _command_failure(
-			"ACTIVITY_STATE_CHANGED",
-			["activity query 必须使用稳定 residentId"],
-		)
-	var resident := _residents[normalized_id] as Dictionary
-	if not resident_override.is_empty():
-		resident = resident_override.duplicate(true)
-	var absolute_minute := int(_environment.get_absolute_minute())
-	var option_by_id: Dictionary = {}
-	var result := {
-		"ok": true,
-		"errorCode": "",
-		"options": [],
-	}
-	var query_occupation_ids := _work_occupation_ids_for_resident(
-		normalized_id,
+	return ACTIVITY_OPTION_QUERY.query(
+		self,
+		resident_id,
+		resident_override,
+		max_uncached_reachability_checks,
+		priority_activity_id,
 	)
-	if query_occupation_ids.is_empty():
-		query_occupation_ids.append("")
-	for occupation_id: String in query_occupation_ids:
-		var social_state := (
-			resident.get("socialState", {}) as Dictionary
-		).duplicate(true)
-		if not occupation_id.is_empty():
-			social_state["occupationId"] = occupation_id
-		var occupation_result := _activity_runtime.query_options(
-			normalized_id,
-			social_state,
-			String(resident.get("currentPlace", "")),
-			absolute_minute % 1440,
-			get_weather(),
-		) as Dictionary
-		if occupation_result.get("ok") != true:
-			result = occupation_result
-			break
-		for option_value: Variant in occupation_result.get(
-			"options",
-			[],
-		) as Array:
-			var option := option_value as Dictionary
-			var activity_id := String(option.get("activityId", ""))
-			if (
-				not option_by_id.has(activity_id)
-				or bool(option.get("available", false))
-			):
-				option_by_id[activity_id] = option.duplicate(true)
-	if result.get("ok") == true:
-		var activity_ids: Array[String] = []
-		for activity_id_value: Variant in option_by_id:
-			activity_ids.append(String(activity_id_value))
-		activity_ids.sort()
-		var merged_options: Array[Dictionary] = []
-		for activity_id: String in activity_ids:
-			merged_options.append(
-				(
-					option_by_id.get(activity_id, {}) as Dictionary
-				).duplicate(true),
-			)
-		result["options"] = merged_options
-	if result.get("ok") == true:
-		# 同一次查询里，不同活动选项的候选经常落在同一区域/落点，
-		# 可达性寻路按目标去重，避免重复的整张路网 A*。
-		var reachability_memo := {}
-		for option_value: Variant in result.get("options", []) as Array:
-			var option := option_value as Dictionary
-			_apply_sleep_activity_availability(resident, option)
-			_apply_bulletin_activity_availability(
-				normalized_id,
-				option,
-			)
-			_apply_work_task_activity_availability(
-				normalized_id,
-				resident,
-				option,
-			)
-			_apply_occupation_service_activity_availability(
-				normalized_id,
-				option,
-			)
-			_apply_clinic_visitor_activity_availability(
-				normalized_id,
-				option,
-			)
-			_apply_clinic_practitioner_request_priority(
-				normalized_id,
-				option,
-			)
-			# Weather is part of the formal activity contract. A later
-			# reachability check may further disable an available option, but
-			# it must never reopen an option that weather already rejected.
-			if not bool(option.get("available", false)):
-				continue
-			var candidates := _activity_runtime.query_preflight_candidates(
-				_activity_social_state_for(
-					normalized_id,
-					String(option.get("activityId", "")),
-				),
-				String(resident.get("currentPlace", "")),
-				String(option.get("activityId", "")),
-			) as Array
-			# 可达性探测在第一个可达候选处停止；按与居民的直线距离
-			# 预排序，让最可能可达的候选先寻路，减少每个选项的 A* 次数。
-			# 只影响探测顺序，不影响"任一可达即可用"的判定结果。
-			var probe_origin := resident.get("position", Vector2.ZERO) as Vector2
-			candidates.sort_custom(func(left: Dictionary, right: Dictionary) -> bool:
-				var left_pos := left.get("memberPosition", []) as Array
-				var right_pos := right.get("memberPosition", []) as Array
-				var left_dist := (
-					probe_origin.distance_squared_to(
-						Vector2(float(left_pos[0]), float(left_pos[1])),
-					)
-					if left_pos.size() == 2
-					else INF
-				)
-				var right_dist := (
-					probe_origin.distance_squared_to(
-						Vector2(float(right_pos[0]), float(right_pos[1])),
-					)
-					if right_pos.size() == 2
-					else INF
-				)
-				return left_dist < right_dist
-			)
-			var has_unreserved := false
-			var has_reachable := false
-			for candidate_value: Variant in candidates:
-				var candidate := candidate_value as Dictionary
-				if not bool(candidate.get("memberAvailable", false)):
-					continue
-				has_unreserved = true
-				if _activity_query_candidate_reachable(
-					resident,
-					candidate,
-					String(option.get("label", "")),
-					reachability_memo,
-				):
-					has_reachable = true
-					break
-			option["available"] = has_reachable
-			option["disabledReason"] = (
-				""
-				if has_reachable
-				else (
-					"ACTIVITY_TARGET_UNREACHABLE"
-					if has_unreserved
-					else "ACTIVITY_RESERVATION_CONFLICT"
-				)
-			)
-	return _decorate_command_result(result)
 
 
 func _resident_sleep_needed(resident: Dictionary) -> bool:
@@ -8770,6 +8633,13 @@ func _publish_community_announcement(
 	) as Dictionary
 	var event_sequence_before := _event_sequence
 	var announcement_event_id := _next_world_event_id()
+	var announcement_schedule := ANNOUNCEMENT_TIME_PARSER.parse(
+		text,
+		int(_environment.get_absolute_minute()),
+	) as Dictionary
+	var time_expression_detected := (
+		ANNOUNCEMENT_TIME_PARSER.has_time_expression(text)
+	)
 	var result := _community_bulletin.publish(
 		publisher_id,
 		text,
@@ -8778,6 +8648,7 @@ func _publish_community_announcement(
 		get_time(),
 		delivery_mode,
 		announcement_event_id,
+		announcement_schedule,
 	) as Dictionary
 	if result.get("ok") != true:
 		_event_sequence = event_sequence_before
@@ -8834,11 +8705,16 @@ func _publish_community_announcement(
 	_trim_announcement_history()
 	var announcement_event := _materialize_world_event({
 		"type": "公告发布",
+		"announcement_priority": ANNOUNCEMENT_RESIDENT_RUNTIME.priority_for_publisher(self, publisher_id),
 		"announcement_id": String(
 			announcement.get("announcement_id", "")
 		),
 		"publisher_resident_id": String(
 			announcement.get("publisher_id", publisher_id)
+		),
+		"publisher_name": ANNOUNCEMENT_RESIDENT_RUNTIME.publisher_name(
+			self,
+			String(announcement.get("publisher_id", publisher_id)),
 		),
 		"text": String(announcement.get("text", "")),
 		"matter_id": (
@@ -8851,9 +8727,15 @@ func _publish_community_announcement(
 		"time": (
 			announcement.get("time", get_time()) as Dictionary
 		).duplicate(true),
+		"scheduled_absolute_minute": int(
+			announcement.get("scheduled_absolute_minute", -1),
+		),
+		"scheduled_time_label": String(
+			announcement.get("scheduled_time_label", ""),
+		),
 	}, announcement_event_id)
 	for resident_value: Variant in broadcast_result.get(
-		"resident_ids",
+		"reaction_resident_ids",
 		[],
 	) as Array:
 		_enqueue_world_event(
@@ -8889,6 +8771,10 @@ func _publish_community_announcement(
 		"announcement": announcement,
 		"eventId": String(announcement_event.get("event_id", "")),
 		"broadcastEventId": broadcast_event_id,
+		"scheduleRecognized": not announcement_schedule.is_empty(),
+		"scheduleWarning": (
+			time_expression_detected and announcement_schedule.is_empty()
+		),
 	})
 
 
@@ -9382,6 +9268,7 @@ func _take_probe_lap(key: String, lap_started_usec: int) -> int:
 func _refresh_pending_wake_snapshot(
 	resident_id: String,
 	resident: Dictionary,
+	frame_budgeted := false,
 ) -> void:
 	var pending := resident.get("pendingWake", {}) as Dictionary
 	if pending.is_empty():
@@ -9402,6 +9289,7 @@ func _refresh_pending_wake_snapshot(
 		and _go_action_can_prefetch_decision(
 			resident.get("currentAction", {}) as Dictionary,
 		),
+		frame_budgeted,
 	)
 
 
@@ -9449,7 +9337,7 @@ func refresh_pending_decision_request_by_id(
 	var current_weather := get_weather()
 	var refresh_started_usec := Time.get_ticks_usec() if _frame_probe != null else 0
 	if AGENT_WAKE_STATE_RUNTIME.needs_refresh(resident, 0, ""):
-		_refresh_pending_wake_snapshot(resident_id, resident)
+		_refresh_pending_wake_snapshot(resident_id, resident, true)
 		AGENT_WAKE_STATE_RUNTIME.mark_built(resident, current_minute, current_weather)
 		_take_probe_lap("agentDispatchRefreshUsec", refresh_started_usec)
 	return {
@@ -9459,8 +9347,6 @@ func refresh_pending_decision_request_by_id(
 		"decisionId": decision_id,
 		"wakePacket": (resident.get("pendingWake", {}) as Dictionary).duplicate(true),
 	}
-
-
 func redispatch_decision_request_by_id(resident_id: String, decision_id: String) -> bool:
 	return redispatch_decision_request(resident_id, decision_id)
 func redispatch_decision_request(resident_ref: String, decision_id: String) -> bool:
@@ -9611,6 +9497,8 @@ func submit_agent_decision(resident_name: String, decision: Dictionary) -> Dicti
 		inflight_events,
 	)
 	probe_lap_usec = WORLD_PERFORMANCE_PROBE.record_lap(probe_lap_usec, "submission_prechecks")
+	var announcement_priority_error := ANNOUNCEMENT_RESIDENT_RUNTIME.player_priority_handling_error(decision, inflight_events)
+	if not announcement_priority_error.is_empty(): return announcement_priority_error
 	if not invitation_requires_reply and not pending_post_injury_reaction.is_empty():
 		var post_injury_error := _post_injury_reaction_action_error(
 			resident,
@@ -9690,6 +9578,12 @@ func submit_agent_decision(resident_name: String, decision: Dictionary) -> Dicti
 			resident_name,
 			decision_id,
 			decision.get("reaction", {}) as Dictionary,
+			(
+				decision.get("announcement_reactions", []) as Array
+				if decision.get("announcement_reactions", []) is Array
+				else []
+			),
+			inflight_events,
 			inflight_results,
 		)
 		return _complete_agent_submission(
@@ -9750,6 +9644,12 @@ func submit_agent_decision(resident_name: String, decision: Dictionary) -> Dicti
 		resident_name,
 		decision_id,
 		decision.get("reaction", {}) as Dictionary,
+		(
+			decision.get("announcement_reactions", []) as Array
+			if decision.get("announcement_reactions", []) is Array
+			else []
+		),
+		inflight_events,
 		inflight_results,
 	)
 	if not conflict_intent.is_empty():
@@ -10427,7 +10327,12 @@ func _submit_agent_activity(
 			"做活动必须包含当前可做的 activity_id 和非空 line",
 		)
 	var available := false
-	for option_value: Variant in _agent_available_activities(resident):
+	for option_value: Variant in _agent_available_activities(
+		resident,
+		true,
+		activity_id,
+		1,
+	):
 		if String(
 			(option_value as Dictionary).get("activity_id", "")
 		) == activity_id:
@@ -11967,6 +11872,8 @@ func _world_event_coalescing_key(event: Dictionary) -> String:
 			return "天气变了|%s" % String(event.get("weather", ""))
 		"公告发布":
 			return "公告发布|%s" % String(event.get("announcement_id", ""))
+		"公告到点":
+			return "公告到点|%s" % String(event.get("announcement_id", ""))
 		"钟声公告":
 			return "钟声公告|%s" % String(event.get("announcement_id", ""))
 		"公告阅读":
@@ -12526,58 +12433,19 @@ func _emit_resident_reaction(
 	resident_id: String,
 	decision_id: String,
 	reaction: Dictionary,
+	announcement_reactions: Array = [],
+	inflight_events: Array = [],
 	inflight_results: Array = [],
 ) -> void:
-	var resolved_reaction := reaction.duplicate(true)
-	if resolved_reaction.is_empty():
-		resolved_reaction = _required_result_reaction(inflight_results)
-	if resolved_reaction.is_empty():
-		return
-	var source_action_id := String(
-		resolved_reaction.get("source_action_id", "")
-	).strip_edges()
-	var payload := {
-		"reactionId": "%s::reaction" % decision_id,
-		"decisionId": decision_id,
-		"sourceActionId": source_action_id,
-		"residentId": resident_id,
-		"text": String(resolved_reaction.get("text", "")).strip_edges(),
-		"time": get_time(),
-		"worldRevision": _world_revision,
-	}
-	resident_reaction_created.emit(
-		_resident_display_name(resident_id),
-		payload.duplicate(true),
+	ANNOUNCEMENT_RESIDENT_RUNTIME.emit_reactions(
+		self,
+		resident_id,
+		decision_id,
+		reaction,
+		announcement_reactions,
+		inflight_events,
+		inflight_results,
 	)
-
-
-func _required_result_reaction(results: Array) -> Dictionary:
-	var source_action_id := _reaction_source_action_id(results)
-	if source_action_id.is_empty():
-		return {}
-	for index in range(results.size() - 1, -1, -1):
-		var value: Variant = results[index]
-		if not value is Dictionary:
-			continue
-		var result := value as Dictionary
-		if String(result.get("action_id", "")).strip_edges() != source_action_id:
-			continue
-		var status := String(result.get("status", ""))
-		var text := ""
-		match status:
-			"completed":
-				text = "这件事总算做完了。"
-			"interrupted":
-				text = "刚才被打断了。"
-			"rejected", "failed":
-				text = "这次没能办成。"
-		if text.is_empty():
-			return {}
-		return {
-			"source_action_id": source_action_id,
-			"text": text,
-		}
-	return {}
 
 
 func _validate_action_shape(action: Dictionary) -> String:
@@ -12774,6 +12642,19 @@ func _preflight_activity_candidates(
 			"retryable": true,
 			"errors": ["当前活动的确定性 slot/member 已被预约"],
 		}
+	# 活动列表生成唤醒包时已经为“可做”候选跑过一次正式寻路。同一游戏
+	# 分钟、同一居民位置下，优先复用那条已经验证过的路线，避免模型结果
+	# 返回时再次扫描整张路网。预约可用性和区域占用仍以本次 validated 为准。
+	var cached_candidates: Array = []
+	var uncached_candidates: Array = []
+	for candidate_value: Variant in candidates_to_try:
+		var candidate := candidate_value as Dictionary
+		if _activity_cached_prepared_action(resident, candidate).is_empty():
+			uncached_candidates.append(candidate)
+		else:
+			cached_candidates.append(candidate)
+	if not cached_candidates.is_empty():
+		candidates_to_try = cached_candidates + uncached_candidates
 	var has_available_candidate := false
 	for candidate_value: Variant in candidates_to_try:
 		if bool((candidate_value as Dictionary).get("memberAvailable", false)):
@@ -12806,15 +12687,28 @@ func _preflight_activity_candidates(
 			"verb": String(candidate.get("targetActionVerb", "")),
 			"line": String(validated.get("activityLabel", "")),
 		}
-		var prepared := (
-			_prepare_region_activity_action(
-				resident,
-				action,
-				candidate,
-			)
-			if String(candidate.get("targetType", "")) == "region"
-			else _prepare_prop_action(resident, action)
+		var cached_action := _activity_cached_prepared_action(
+			resident,
+			candidate,
 		)
+		var prepared := {}
+		if cached_action.is_empty():
+			prepared = (
+				_prepare_region_activity_action(
+					resident,
+					action,
+					candidate,
+				)
+				if String(candidate.get("targetType", "")) == "region"
+				else _prepare_prop_action(resident, action)
+			)
+		else:
+			cached_action["action_id"] = String(validated.get("actionId", ""))
+			cached_action["type"] = "用道具"
+			cached_action["prop"] = String(candidate.get("targetPropName", ""))
+			cached_action["verb"] = String(candidate.get("targetActionVerb", ""))
+			cached_action["line"] = String(validated.get("activityLabel", ""))
+			prepared = {"ok": true, "action": cached_action}
 		if prepared.get("ok") != true:
 			target_unreachable = true
 			continue
@@ -12873,27 +12767,11 @@ func _activity_query_candidate_reachable(
 	# memo 键以目标为准：同一次 query_activity_options 调用里居民原点
 	# 不变，候选落在同一区域/道具上的可达性结论可以直接复用，
 	# 不必为每个活动选项重复跑整张路网的寻路。
-	var memo_key := "%s|%s|%s|%s|%s,%s" % [
-		String(candidate.get("targetType", "")),
-		String(candidate.get("targetRegionId", "")),
-		String(candidate.get("targetPropName", "")),
-		String(candidate.get("targetActionVerb", "")),
-		str(member_position[0]),
-		str(member_position[1]),
-	]
+	var memo_key := _activity_candidate_memo_key(candidate)
 	if reachability_memo.has(memo_key):
 		return bool(reachability_memo[memo_key])
-	var cache_minute := int(_environment.get_absolute_minute())
-	if cache_minute != _activity_reachability_cache_minute:
-		_activity_reachability_cache.clear()
-		_activity_reachability_cache_minute = cache_minute
-	var origin := resident.get("position", Vector2.ZERO) as Vector2
-	var cache_key := "%s|%d,%d|%s" % [
-		String(resident.get("residentId", "")),
-		int(round(origin.x)),
-		int(round(origin.y)),
-		memo_key,
-	]
+	_ensure_activity_reachability_cache_minute()
+	var cache_key := _activity_candidate_cache_key(resident, candidate)
 	if _activity_reachability_cache.has(cache_key):
 		return bool(_activity_reachability_cache[cache_key])
 	var action := {
@@ -12903,6 +12781,9 @@ func _activity_query_candidate_reachable(
 		"verb": String(candidate.get("targetActionVerb", "")),
 		"line": activity_label,
 	}
+	var route_probe_started_usec := (
+		Time.get_ticks_usec() if _frame_probe != null else 0
+	)
 	var prepared := (
 		_prepare_region_activity_action(
 			resident,
@@ -12912,6 +12793,16 @@ func _activity_query_candidate_reachable(
 		if String(candidate.get("targetType", "")) == "region"
 		else _prepare_prop_action(resident, action)
 	)
+	if _frame_probe != null:
+		_take_probe_lap(
+			"agentActivityQueryRouteUsec",
+			route_probe_started_usec,
+		)
+		_frame_probe.record(
+			Engine.get_process_frames(),
+			"agentActivityQueryRouteCount",
+			1,
+		)
 	if prepared.get("ok") != true:
 		reachability_memo[memo_key] = false
 		_activity_reachability_cache[cache_key] = false
@@ -12932,7 +12823,59 @@ func _activity_query_candidate_reachable(
 	)
 	reachability_memo[memo_key] = reachable
 	_activity_reachability_cache[cache_key] = reachable
+	if reachable:
+		_activity_prepared_action_cache[cache_key] = prepared_action.duplicate(true)
 	return reachable
+
+
+func _ensure_activity_reachability_cache_minute() -> void:
+	var cache_minute := int(_environment.get_absolute_minute())
+	if cache_minute == _activity_reachability_cache_minute:
+		return
+	_activity_reachability_cache.clear()
+	_activity_prepared_action_cache.clear()
+	_activity_reachability_cache_minute = cache_minute
+
+
+func _activity_candidate_memo_key(candidate: Dictionary) -> String:
+	var member_position := candidate.get("memberPosition", []) as Array
+	return "%s|%s|%s|%s|%s,%s" % [
+		String(candidate.get("targetType", "")),
+		String(candidate.get("targetRegionId", "")),
+		String(candidate.get("targetPropName", "")),
+		String(candidate.get("targetActionVerb", "")),
+		str(member_position[0]) if member_position.size() == 2 else "",
+		str(member_position[1]) if member_position.size() == 2 else "",
+	]
+
+
+func _activity_candidate_cache_key(
+	resident: Dictionary,
+	candidate: Dictionary,
+) -> String:
+	var origin := resident.get("position", Vector2.ZERO) as Vector2
+	return "%s|%s|%s|%d,%d|%s|%s" % [
+		String(resident.get("residentId", "")),
+		String(resident.get("spaceId", "")),
+		String(resident.get("currentPlace", "")),
+		int(round(origin.x)),
+		int(round(origin.y)),
+		str(resident.get("routeConnector", []) as Array),
+		_activity_candidate_memo_key(candidate),
+	]
+
+
+func _activity_cached_prepared_action(
+	resident: Dictionary,
+	candidate: Dictionary,
+) -> Dictionary:
+	if int(_environment.get_absolute_minute()) != _activity_reachability_cache_minute:
+		return {}
+	var cached := _activity_prepared_action_cache.get(
+		_activity_candidate_cache_key(resident, candidate),
+		{},
+	) as Dictionary
+	return cached.duplicate(true)
 
 
 func _prepare_region_activity_action(
@@ -13715,6 +13658,7 @@ func _advance_wait_action(
 		and elapsed <= move_duration
 		and action.get("idlePathPoints") is Array
 	):
+		var wait_move_lap_usec := Time.get_ticks_usec() if _advance_profile_enabled else 0
 		var path_points: Array[Vector2] = []
 		path_points.assign(action.get("idlePathPoints", []) as Array)
 		var ratio := clampf(
@@ -13726,10 +13670,20 @@ func _advance_wait_action(
 		# 路径本身已经满足对应空间的可行走合同。逐分钟再次做最近安全点
 		# 径向搜索会让所有居民在同一秒重复扫描碰撞数据，造成周期卡顿。
 		var next_position := _point_along_polyline(path_points, ratio)
+		wait_move_lap_usec = _advance_profile_lap(
+			_advance_profile_scratch,
+			"actionsWaitPathSampleUsec",
+			wait_move_lap_usec,
+		)
 		var previous_place := String(resident.get("currentPlace", ""))
 		var membership := PERCEPTION_RUNTIME._membership(self,
 			String(resident.get("spaceId", "")),
 			next_position,
+		)
+		wait_move_lap_usec = _advance_profile_lap(
+			_advance_profile_scratch,
+			"actionsWaitMembershipUsec",
+			wait_move_lap_usec,
 		)
 		var position_changed := _apply_authoritative_resident_position(
 			resident,
@@ -13748,10 +13702,26 @@ func _advance_wait_action(
 				)
 			),
 		)
-		_emit_place_change(resident_name, previous_place)
+		wait_move_lap_usec = _advance_profile_lap(
+			_advance_profile_scratch,
+			"actionsWaitApplyPositionUsec",
+			wait_move_lap_usec,
+		)
+		var place_changed := _emit_place_change(
+			resident_name,
+			previous_place,
+			true,
+		)
 		# C1(docs/居民状态通知链减负方案.md):表现真变化才发。
-		if position_changed:
-			_emit_resident_state_changed(resident_name)
+		if position_changed and not place_changed:
+			# 权威位置已经在本分钟写入；画面刷新按帧预算发送，避免 15 位
+			# 正在闲逛的居民在同一主线程帧里依次重建表现状态。
+			_queue_resident_state_refresh(resident_name)
+		_advance_profile_lap(
+			_advance_profile_scratch,
+			"actionsWaitStateQueueUsec",
+			wait_move_lap_usec,
+		)
 	if absolute_minute >= int(action.get("completeAbsoluteMinute", INF)):
 		_finish_action(resident_name, "已经停留了一会儿")
 
@@ -14999,6 +14969,7 @@ func _wake_packet(
 	results: Array,
 	social_results_value: Variant = null,
 	prefetch_arrival_context: bool = false,
+	frame_budgeted := false,
 ) -> Dictionary:
 	var perception_resident := resident
 	if prefetch_arrival_context:
@@ -15046,7 +15017,10 @@ func _wake_packet(
 		"destinations": _agent_travel_destinations(perception_resident),
 		"visible_props": _agent_visible_props(perception_resident),
 		"props": _agent_available_props(perception_resident),
-		"activities": _agent_available_activities(perception_resident),
+		"activities": _agent_available_activities(
+			perception_resident,
+			frame_budgeted,
+		),
 		"service_control": _service_control_for_resident(perception_resident),
 		"message_recipients": _ordinary_private_message_recipients(
 			resident_name,
@@ -15115,6 +15089,7 @@ func _wake_packet(
 				resident_name,
 				resident,
 				public_events,
+				frame_budgeted,
 			),
 			"social_matters": _social_agent_adapter.build_social_matters(
 				resident_name,
@@ -15224,6 +15199,7 @@ func _conversation_follow_up_options(
 	resident_id: String,
 	resident: Dictionary,
 	events: Array,
+	frame_budgeted := false,
 ) -> Array[Dictionary]:
 	var conversation := CONVERSATION_RUNTIME._active_conversation_for_person(self, resident_id)
 	if (
@@ -15275,7 +15251,10 @@ func _conversation_follow_up_options(
 				"success_result_id": "conversation-escort-arrived",
 				"place_id": place_id,
 			})
-	for activity_value: Variant in _agent_available_activities(resident):
+	for activity_value: Variant in _agent_available_activities(
+		resident,
+		frame_budgeted,
+	):
 		if (
 			not requested_place_ids.is_empty()
 			and not requested_place_ids.has(
@@ -15757,32 +15736,12 @@ func _agent_life_destination_options(
 func _agent_known_announcements(
 	resident_id: String,
 ) -> Array[Dictionary]:
-	var records := {}
-	for value: Variant in _community_bulletin.knowledge_for(
+	return ANNOUNCEMENT_RESIDENT_RUNTIME.known_announcements(
+		self,
+		_community_bulletin,
 		resident_id,
-	) as Array:
-		var record := value as Dictionary
-		records[String(record.get("announcement_id", ""))] = record
-	var result: Array[Dictionary] = []
-	for announcement: Dictionary in _community_bulletin.get_announcements(
-		true,
-	) as Array[Dictionary]:
-		var announcement_id := String(
-			announcement.get("announcement_id", ""),
-		)
-		if not records.has(announcement_id):
-			continue
-		var record := records.get(announcement_id, {}) as Dictionary
-		result.append({
-			"announcement_id": announcement_id,
-			"text": String(announcement.get("text", "")),
-			"publisher_resident_id": String(
-				announcement.get("publisher_id", ""),
-			),
-			"acquired_via": String(record.get("acquired_via", "")),
-			"active": bool(announcement.get("active", false)),
-		})
-	return result
+		MAX_AGENT_KNOWN_ANNOUNCEMENTS,
+	)
 
 
 func _agent_visible_props(resident: Dictionary) -> Array[String]:
@@ -16952,10 +16911,12 @@ func _enqueue_world_event(
 		AGENT_WAKE_STATE_RUNTIME.mark_dirty(resident)
 	world_event_created.emit(_resident_display_name(resident_name), identified_event)
 	if schedule_event:
+		if ANNOUNCEMENT_RESIDENT_RUNTIME.schedule_player_priority_decision(self, resident_name, event): return identified_event
 		var event_type := String(event.get("type", ""))
 		var wake_while_current_action := event_type in [
 			"有人来了",
 			"有人走了",
+			"公告到点",
 		]
 		_schedule_decision(
 			resident_name,
@@ -17075,17 +17036,20 @@ func _player_command_result(command: String, ok: bool, reason: String, extra: Di
 	return result
 
 
-func _emit_place_change(resident_name: String, previous_place: String) -> void:
+func _emit_place_change(
+	resident_name: String,
+	previous_place: String,
+	defer_signal := false,
+) -> bool:
 	var resident := _residents[resident_name] as Dictionary
 	var current_place := String(resident.get("currentPlace", ""))
 	if previous_place == current_place:
-		return
+		return false
 	var place_change := {
 		"residentId": resident_name,
 		"from": previous_place,
 		"to": current_place,
 		"time": get_time(),
-		"state": get_resident_state(resident_name),
 		"worldRevision": _world_revision,
 	}
 	_append_public_event_log(
@@ -17142,7 +17106,15 @@ func _emit_place_change(resident_name: String, previous_place: String) -> void:
 		_action_story_context[
 			String(current_action.get("action_id", ""))
 		] = story_context
-	resident_place_changed.emit(_resident_display_name(resident_name), place_change)
+	if defer_signal:
+		_queue_resident_place_change_signal(resident_name, place_change)
+	else:
+		place_change["state"] = get_resident_state(resident_name)
+		resident_place_changed.emit(
+			_resident_display_name(resident_name),
+			place_change,
+		)
+	return true
 
 
 func _apply_route_sample(
@@ -17219,20 +17191,39 @@ func _presentation_action(action: Dictionary) -> Dictionary:
 	return result
 
 
-func _agent_available_activities(resident: Dictionary) -> Array:
+func _agent_available_activities(
+	resident: Dictionary,
+	frame_budgeted := false,
+	priority_activity_id := "",
+	max_uncached_route_checks_override := -2,
+) -> Array:
 	var resident_id := String(resident.get("residentId", ""))
 	var current_place := String(resident.get("currentPlace", ""))
 	var service_state := (
 		_place_service_states.get(current_place, {}) as Dictionary
 	)
-	var query := query_activity_options(resident_id, resident)
+	var query := query_activity_options(
+		resident_id,
+		resident,
+		(
+			max_uncached_route_checks_override
+			if max_uncached_route_checks_override >= -1
+			else MAX_AGENT_ACTIVITY_ROUTE_CHECKS_PER_WAKE
+			if frame_budgeted
+			else -1
+		),
+		priority_activity_id,
+	)
 	if query.get("ok") != true:
 		return []
 	var result: Array[Dictionary] = []
 	var attributes := resident.get("attributes", {}) as Dictionary
 	for option_value: Variant in query.get("options", []) as Array:
 		var option := option_value as Dictionary
-		if not bool(option.get("available", false)):
+		var route_check_deferred := bool(
+			option.get("routeCheckDeferred", false)
+		)
+		if not bool(option.get("available", false)) and not route_check_deferred:
 			continue
 		var activity_id := String(option.get("activityId", ""))
 		if (
@@ -17282,6 +17273,7 @@ func _agent_available_activities(resident: Dictionary) -> Array:
 			"activity_id": activity_id,
 			"label": String(option.get("label", "")),
 			"role": role,
+			"route_check_deferred": route_check_deferred,
 			"advances_current_work_task": not matching_task_ids.is_empty(),
 			"work_task_ids": matching_task_ids,
 			"work_task_capabilities": matching_task_capabilities,
@@ -22728,6 +22720,10 @@ func _record_announcement_broadcast_knowledge(
 		_environment.get_absolute_minute(),
 	)
 	var resident_ids: Array[String] = []
+	var reaction_resident_ids: Array[String] = []
+	var publisher_id := String(
+		announcement.get("publisher_id", ""),
+	).strip_edges()
 	for resident_id: String in _resident_order:
 		if not _residents.has(resident_id):
 			continue
@@ -22749,10 +22745,17 @@ func _record_announcement_broadcast_knowledge(
 				),
 			}
 		resident_ids.append(resident_id)
+		if resident_id != publisher_id and _resident_is_alive(resident_id):
+			reaction_resident_ids.append(resident_id)
 	return {
 		"ok": true,
 		"resident_ids": resident_ids,
+		"reaction_resident_ids": reaction_resident_ids,
 	}
+
+
+func _advance_announcement_schedules(absolute_minute: int) -> void:
+	ANNOUNCEMENT_RESIDENT_RUNTIME.advance_schedules(self, _community_bulletin, absolute_minute)
 
 func _deliver_town_bell_announcement(
 	announcement: Dictionary,

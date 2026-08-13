@@ -138,6 +138,10 @@ rmdir "$check_root"
 
 含义：脚本引用的资源不在 CI 取得的提交中，或者路径不完全一致。
 
+防复发检查会解析单个字符串、带尾逗号以及由多个字符串字面量拼接成的
+`preload()` 路径；使用变量或运行时计算路径的加载不属于这项静态检查，仍需依靠
+Godot 无头导入确认。
+
 按顺序检查：
 
 1. 文件是否真实存在。
@@ -220,6 +224,16 @@ CI 最后会检查 `git status --porcelain`。常见来源：
 
 应修复测试或功能本身，不要删除通过标记检查。
 
+### provider 测试通过但退出报告资源泄漏
+
+表现：provider 测试输出了约定的 `*_PASS` 标记，功能断言也通过，但退出时出现 `ERROR: N resources still in use at exit`；Agent runner 因此把子测试记为失败。
+
+直接原因：请求完成回调通过闭包捕获请求状态，而请求状态又保存失败回调，形成引用循环；同步注入 transport 最容易触发，因为请求在创建超时看门狗之前就已经完成。
+
+处理方法：在成功、失败、超时和取消的共同结算路径中清空请求状态保存的回调；transport 返回后如果请求已经同步完成，不再创建 watchdog。watchdog 的 `timeout` 信号回调中只能使用 `queue_free()`，不能直接 `free()` 被 Godot 锁定的计时器。不要放宽 runner 对行首 `ERROR:` 或资源泄漏的检查。
+
+最终验证：provider robustness 测试必须覆盖有效宿主节点下的同步 transport，确认请求只结算一次、没有残留在途取消状态，并重新运行 Agent 离线套件和完整正式入口套件。不要把 watchdog 的具体实现（例如宿主子节点数量）写成测试契约，应断言超时、完成和取消的行为。
+
 ### 发行工作流拒绝运行
 
 常见提示包括“只能从 main 分支手动运行”“当前提交不是远端 main 的最新提交”或“标签已存在”。这些是防止从旧代码发行、覆盖已有版本的检查项，不应删除。
@@ -247,6 +261,21 @@ Windows 包必须同时包含 `.exe` 与 `.pck`，macOS 包必须包含 `.app/Co
 表现：测试中的行为已经正确，但断言从公开投影读取只存在于 World 内部的状态字段，或用显示名称查找按稳定 ID 建立的内部状态表，得到 `null` 并使正式测试退出失败。
 
 处理方式：先确认失败字段是否属于生产入口的公开返回契约；如果只是测试用的内部状态，应从测试 World 的内部居民记录读取，并使用测试已有的稳定 ID 常量，不要用显示名称猜测字典键；另外保留公开投影的行为断言。不要为了让断言通过而把内部调试字段泄露到生产接口。
+
+### 修改活动源数据后，World 启动报告活动收据指纹不匹配
+
+表现：Godot 无头导入和活动专项测试可以通过，但 Agent 离线套件中的正式 Bootstrap 返回 `WORLD_DATA_INVALID`；错误包含“Activity Integration 收据与 exact source fingerprint 不匹配”或“未绑定 exact 七份源文档”。
+
+直接原因：修改了 `world/data/town/source/activity_definitions.json` 等活动源文档，并手动同步了 `town_world.json` 中的业务字段，却没有通过正式构建入口重算 `activityIntegrationReceipt.sourceFingerprint` 和对应文档指纹。只改生成文件里的活动值不能完成来源校验。
+
+处理方法：修改活动源文档后运行：
+
+```sh
+"$GODOT_BIN" --headless --path game \
+  --script res://world/data/town/TownWorldDataBuild.gd
+```
+
+确认输出 `TOWN_WORLD_DATA_BUILD_PASS`，检查生成差异只包含预期业务字段和活动收据，再运行正式 Bootstrap 或 Agent 离线套件。不要手工计算或复制指纹。
 
 ## 查看 GitHub CI 日志
 
@@ -281,6 +310,30 @@ gh run view <运行编号> --log-failed \
 - Godot 大量素材导入进度：应继续看到日志末尾的脚本错误检查结果。
 
 ## 已发生案例
+
+### 2026-08-12：备餐时长调整后遗漏活动收据重建
+
+表现：食堂活动回归和防复发守卫均通过，远端 Agent 离线套件为 `47/48`；唯一失败的 `agent_debug_lab_test.gd` 在正式 Bootstrap 启动时得到 `WORLD_DATA_INVALID`，后续居民数、存档和恢复断言都是连带失败。
+
+直接原因：统一备餐时长从 60 分钟调整为 30 分钟后，只同步了活动源文档和 `town_world.json` 中的活动定义，没有运行 `TownWorldDataBuild.gd`，导致生成数据仍携带修改前的活动来源指纹。
+
+修复：使用正式世界数据构建入口重新生成 `town_world.json`，同步新的 `activity_definitions.json` 文档指纹和组合来源指纹；随后先单独复查 `agent_debug_lab_test.gd`，再运行完整远端正式套件。
+
+最终验证：修复 head 的 Agent 离线套件、15 项正式故事、独立正式入口和测试后源码清洁检查全部通过；远端正式套件用时 14 分 39 秒，防复发守卫同时通过。
+
+### 2026-08-12：模型请求生命周期修复引入 provider 资源泄漏
+
+表现：快速重开对话修复的 guards 通过，但正式验证中 Agent 离线套件为 `passed=39 failed=9`；9 个 provider 用例都打印了通过标记，随后因 Godot 退出资源泄漏被 runner 判定失败。
+
+直接原因：新请求状态保存了捕获自身的失败结算闭包，provider 测试中的同步 transport 使循环引用一直存活；同步完成后还会继续创建 watchdog。
+
+修复：结算时断开请求状态与闭包的引用，并在 transport 已同步完成时跳过 watchdog；补充同步 transport 的资源释放回归测试。首次回归测试误把 watchdog 假定为宿主子节点，远端使用 `SceneTreeTimer` 时产生了错误断言，随后改为检查请求行为和在途状态。
+
+后续验证：将 watchdog 改为 `SceneTreeTimer` 后，资源释放虽然交给场景树，但有效宿主下的在途请求不再有可检查的计时器节点，导致 watchdog 生命周期断言失败；最终改为宿主下的一次性 `Timer`，结算时同步停止并释放，保留同步完成跳过 watchdog 的处理。
+
+补充表现：在 timeout 信号回调中直接调用 `free()` 会出现 `Object is locked and can't be freed`，即使测试通过标记仍会被 runner 判为失败；应改用 `queue_free()`，并保留同步 transport 不创建 watchdog 的路径。
+
+最终验证：基准提交同一套正式验证为 `48/48`；修复后必须重新确认 Agent 离线套件 `48/48`，并继续完成正式故事和源码目录清洁检查。
 
 ### 2026-08-08：发行修复 PR 首次运行失败
 
@@ -331,10 +384,12 @@ gh run view <运行编号> --log-failed \
 - [ ] 新增脚本所需的 `.gd.uid` 已确认。
 - [ ] 新测试、预览和工具脚本已分类。
 - [ ] 所有新增资源路径已经检查大小写，并确认文件被 Git 跟踪。
+- [ ] 修改活动源文档后已运行 `TownWorldDataBuild.gd`，并确认活动收据和来源指纹同步更新。
 - [ ] 涉及存档目录、事务或临时文件时，Windows 超长路径恢复与清理测试已经通过。
 - [ ] `tools/guards/run_guards.sh` 通过。
 - [ ] Godot 无头导入没有脚本或引擎错误。
 - [ ] 相关测试通过；发行改动完成正式测试套件。
+- [ ] provider 测试退出时没有资源泄漏；同步 transport 已确认不会残留请求状态或 watchdog。
 - [ ] 发行工作流改动确认 Windows 使用 Linux 构建机、macOS 使用 macOS 构建机。
 - [ ] 测试后 `git status --porcelain` 没有意外变化。
 - [ ] 玩家可见改动已经写入根目录 `更新日志.md`，并已同步 README 的最新更新摘要。

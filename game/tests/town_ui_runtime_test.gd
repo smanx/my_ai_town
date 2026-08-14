@@ -1,4 +1,23 @@
 extends "res://tests/support/TownWorldTestCase.gd"
+
+class AvatarPerceptionWorld:
+	extends RefCounted
+
+	var revision := 2
+
+	func get_world_revision() -> int:
+		return revision
+
+	func get_player_avatar_state() -> Dictionary:
+		return {
+			"residentId": "avatar",
+			"name": "旅行者",
+			"currentPlace": "中心广场",
+			"spaceId": "town_outdoor",
+			"regionId": "town_center",
+			"position": Vector2.ZERO,
+			"nearby": [],
+		}
 ## UI 适配与导航 合并套件。
 ##
 ## 由以下测试合并而来，断言逐条保留：
@@ -1285,6 +1304,10 @@ class AgentGatewayPumpSpy:
 	extends Node
 	var pump_limits: Array[int] = []
 
+	func pump_frame_budgeted(max_requests := 1) -> int:
+		pump_limits.append(max_requests)
+		return 1
+
 	func pump(max_requests := -1) -> int:
 		pump_limits.append(max_requests)
 		return 1
@@ -1294,6 +1317,12 @@ const HOST_SCRIPT := preload(
 )
 const AVATAR_HUD_SCENE := preload(
 	"res://ui/avatar_mode/runtime/AvatarModeHud.tscn"
+)
+const SYSTEM_FEEDBACK_TOAST_SCENE := preload(
+	"res://ui/common/system_feedback/SystemFeedbackToast.tscn"
+)
+const PROVIDER_SETTINGS_SCREEN_SCENE := preload(
+	"res://ui/provider_settings/ProviderSettingsScreen.tscn"
 )
 const RESIDENT_PROFILE_EDITOR_SERVICE_SCRIPT := preload(
 	"res://ui/resident_overview/ResidentProfileEditorService.gd"
@@ -1507,6 +1536,16 @@ const TOWN_HUD_SCENE := preload("res://ui/town/hud/runtime/TownHudOverlay.tscn")
 const AGENT_CONTRACT := preload("res://agent/AgentContract.gd")
 const TEST_KEYBOARD_DEVICE_ID := 16
 const ADAPTER := preload("res://world/presentation/ui/TownUiAdapter.gd")
+const MOBILE_UI_PROFILE := preload("res://ui/mobile/MobileUiProfile.gd")
+const MOBILE_TOUCH_SCROLL_ROUTER := preload(
+	"res://ui/mobile/MobileTouchScrollRouter.gd"
+)
+const MOBILE_TEXT_INPUT_POLICY := preload(
+	"res://ui/mobile/MobileTextInputPolicy.gd"
+)
+const VIRTUAL_JOYSTICK := preload("res://ui/mobile/VirtualJoystick.gd")
+const TOUCH_CAMERA_GESTURE := preload("res://ui/mobile/TouchCameraGesture.gd")
+const MOBILE_MOVEMENT_INPUT := preload("res://ui/mobile/MobileMovementInput.gd")
 
 var _adapter: AdapterHarness
 var _host: Control
@@ -1519,12 +1558,474 @@ func _initialize() -> void:
 
 
 func _run_all() -> void:
+	await _scenario_dynamic_feedback_text_is_complete()
+	await _scenario_mobile_platform_foundation()
 	await _scenario_ui_runtime_host_navigation()
 	await _scenario_formal_ui_runtime_contract()
 	_scenario_game_flow_resident_model_assignment_route()
 	_scenario_session_production_composition()
 	_scenario_hud_pause_clock()
+	_scenario_avatar_perception_only_refreshes_avatar_scope()
 	_finish_suite("TOWN_UI_RUNTIME_PASS")
+
+
+func _scenario_avatar_perception_only_refreshes_avatar_scope() -> void:
+	var adapter := ADAPTER.new()
+	var world := AvatarPerceptionWorld.new()
+	adapter.set("_world", world)
+	adapter.set("_session_config", {
+		"source": "test",
+		"capabilityMode": "formal",
+		"formalReady": true,
+	})
+	adapter.call("_on_player_avatar_perception_changed", {
+		"source": "avatar_position",
+		"semanticStateChanged": false,
+	})
+	_expect(
+		(adapter.get("_pending_world_refresh_scopes") as Array).is_empty(),
+		"化身纯位置感知变化不会排队整套小镇 UI",
+	)
+	_expect(
+		not ((adapter.get("_view_models") as Dictionary).get("avatar", {}) as Dictionary).is_empty(),
+		"化身纯位置感知变化仍立即生成化身目标界面",
+	)
+	adapter.call("_on_world_revision_changed", 2)
+	_expect(
+		(adapter.get("_pending_world_refresh_scopes") as Array).is_empty(),
+		"化身纯位置修订不会在世界修订信号中重新排队 town_hud",
+	)
+	adapter.free()
+
+
+func _scenario_mobile_platform_foundation() -> void:
+	_expect_equal(
+		MOBILE_UI_PROFILE.input_mode(Vector2(960.0, 540.0)),
+		"keyboard_mouse",
+		"桌面小窗口不能按比例误切到触控模式",
+	)
+	_expect_equal(
+		MOBILE_UI_PROFILE.layout_profile(Vector2(960.0, 540.0)),
+		MOBILE_UI_PROFILE.DESKTOP_COMPACT,
+		"桌面小窗口必须保持桌面布局分类",
+	)
+	_expect(
+		MOBILE_UI_PROFILE.is_phone_landscape(Vector2(960.0, 540.0)),
+		"手机横屏尺寸识别应可独立用于布局测试",
+	)
+	var expected_bands := {
+		Vector2(2048.0, 1536.0): "tablet_4_3",
+		Vector2(2160.0, 1440.0): "foldable_or_tablet",
+		Vector2(2400.0, 1350.0): "standard_landscape",
+		Vector2(2520.0, 1080.0): "ultrawide_phone",
+	}
+	for viewport: Vector2 in expected_bands:
+		_expect_equal(
+			MOBILE_UI_PROFILE.adaptive_landscape_band(viewport),
+			expected_bands[viewport],
+			"手机、平板与折叠屏横屏比例分类正确",
+		)
+	var safe := MOBILE_UI_PROFILE.safe_rect(
+		Vector2(2400.0, 1080.0),
+		Vector4(80.0, 20.0, 60.0, 40.0),
+	)
+	_expect_equal(safe.position, Vector2(80.0, 20.0), "安全区起点扣除左上留白")
+	_expect_equal(safe.size, Vector2(2260.0, 1020.0), "安全区尺寸扣除四边留白")
+	var design := MOBILE_UI_PROFILE.centered_design_rect(
+		Vector2(2520.0, 1080.0),
+		Vector2(1920.0, 1080.0),
+	)
+	_expect_equal(design.position, Vector2(300.0, 0.0), "16:9 前景在 21:9 内居中")
+	_expect_equal(design.size, Vector2(1920.0, 1080.0), "居中前景不得横向拉伸")
+	_expect_equal(
+		MOBILE_UI_PROFILE.uniform_cover_scale(
+			Vector2(2520.0, 1080.0),
+			Vector2(1920.0, 1080.0),
+		),
+		1.3125,
+		"铺满背景统一等比缩放",
+	)
+	await _verify_mobile_touch_scroll_router()
+	await _verify_mobile_text_input_policy()
+	await _verify_mobile_scene_interaction()
+	_verify_mobile_page_layout_assets()
+	var project_text := FileAccess.get_file_as_string("res://project.godot")
+	_expect(project_text.contains("window/size/resizable.mobile=true"), "Android 窗口允许重新布局")
+	_expect(project_text.contains("window/size/viewport_width.mobile=1280"), "Android 使用独立参考宽度")
+	_expect(project_text.contains("window/size/viewport_height.mobile=720"), "Android 使用独立参考高度")
+	_expect(project_text.contains("window/handheld/orientation=4"), "Android 锁定自动翻转横屏")
+	var export_text := FileAccess.get_file_as_string("res://export_presets.cfg")
+	_expect(export_text.contains("permissions/internet=true"), "Android 包允许连接模型服务")
+	_expect(
+		export_text.contains("command_line/extra_args=\"--rendering-method gl_compatibility\""),
+		"Android 包明确使用兼容渲染",
+	)
+	var game_flow_host := root.get_node_or_null("GameFlowHost")
+	_expect(game_flow_host != null, "正式入口由自动加载创建")
+	if game_flow_host != null:
+		_expect(
+			game_flow_host.get_node_or_null("MobileTouchScrollRouter") == null,
+			"桌面运行时不能挂载手机触控滚动服务",
+		)
+		_expect(
+			game_flow_host.get_node_or_null("MobileTextInputPolicy") == null,
+			"桌面运行时不能接管文本输入",
+		)
+
+
+func _verify_mobile_touch_scroll_router() -> void:
+	var scroll := ScrollContainer.new()
+	scroll.position = Vector2(120.0, 100.0)
+	scroll.size = Vector2(320.0, 240.0)
+	root.add_child(scroll)
+	var content := Control.new()
+	content.custom_minimum_size = Vector2(300.0, 1200.0)
+	scroll.add_child(content)
+	var router := MOBILE_TOUCH_SCROLL_ROUTER.new() as Node
+	root.add_child(router)
+	router.configure(true)
+	await process_frame
+	var point := Vector2(200.0, 200.0)
+	_expect(not router.consume(_mobile_touch(0, true, point)), "滚动起点不吞普通点击")
+	var drag := InputEventScreenDrag.new()
+	drag.index = 0
+	drag.position = point - Vector2(0.0, 100.0)
+	_expect(router.consume(drag), "手指拖动由滚动路由接管")
+	_expect(scroll.scroll_vertical > 0, "手指上拖后竖向滑条同步前进")
+	_expect(router.consume(_mobile_touch(0, false, drag.position)), "拖动抬手不误触列表项")
+	router.queue_free()
+	scroll.queue_free()
+	await process_frame
+
+
+func _verify_mobile_text_input_policy() -> void:
+	var policy := MOBILE_TEXT_INPUT_POLICY.new() as Node
+	root.add_child(policy)
+	policy.configure(true, true)
+	var line := LineEdit.new()
+	line.position = Vector2(500.0, 100.0)
+	line.size = Vector2(360.0, 80.0)
+	root.add_child(line)
+	await process_frame
+	_expect(not line.virtual_keyboard_enabled, "进入输入页面不能自动唤起键盘")
+	_expect(not line.context_menu_enabled, "Android 输入框交给系统文本操作栏")
+	var point := Vector2(540.0, 130.0)
+	policy.call("_handle_screen_touch", _mobile_touch(1, true, point))
+	_expect_equal(
+		(policy.get("_touch_candidates") as Dictionary).size(),
+		1,
+		"按下输入框后等待区分短按与长按",
+	)
+	var drag := InputEventScreenDrag.new()
+	drag.index = 1
+	drag.position = point + Vector2(40.0, 0.0)
+	policy.call("_handle_screen_drag", drag)
+	var candidates := policy.get("_touch_candidates") as Dictionary
+	_expect(
+		bool((candidates.get(1, {}) as Dictionary).get("moved", false)),
+		"拖动不能误判为点击",
+	)
+	policy.call("_handle_screen_touch", _mobile_touch(1, false, drag.position))
+	_expect_equal(
+		(policy.get("_touch_candidates") as Dictionary).size(),
+		0,
+		"触控结束后清理输入候选状态",
+	)
+	line.grab_focus()
+	policy.call("_show_system_keyboard", line)
+	_expect(bool(policy.get("_keyboard_visible")), "短按后记录已打开的系统键盘")
+	line.release_focus()
+	policy.call("_process", 0.0)
+	_expect(
+		not bool(policy.get("_keyboard_visible")),
+		"输入框失去焦点后收起手动打开的系统键盘",
+	)
+	policy.queue_free()
+	line.queue_free()
+	await process_frame
+
+
+func _verify_mobile_scene_interaction() -> void:
+	for asset_path: String in [
+		"res://assets/ui/avatar_mode/runtime/mobile_joystick/mobile_joystick_base_v2.png",
+		"res://assets/ui/avatar_mode/runtime/mobile_joystick/mobile_joystick_knob_v2.png",
+		"res://assets/ui/avatar_mode/runtime/mobile_context_actions/mobile_talk_action_v1.png",
+		"res://assets/ui/avatar_mode/runtime/mobile_context_actions/mobile_pet_cat_action_v1.png",
+	]:
+		_expect(FileAccess.file_exists(asset_path), "移动端场景交互资产已进入正式资源目录")
+	var joystick := VIRTUAL_JOYSTICK.new() as Control
+	joystick.size = Vector2(300.0, 300.0)
+	root.add_child(joystick)
+	var knob := Control.new()
+	knob.size = Vector2(120.0, 120.0)
+	joystick.add_child(knob)
+	joystick.configure(knob)
+	var movement_events: Array[Vector2] = []
+	joystick.movement_changed.connect(func(value: Vector2) -> void: movement_events.append(value))
+	var press := _mobile_touch(7, true, Vector2(285.0, 150.0))
+	joystick.call("_gui_input", press)
+	_expect((joystick.call("movement") as Vector2).x > 0.7, "摇杆按下后输出连续方向")
+	joystick.call("_gui_input", _mobile_touch(7, false, Vector2(285.0, 150.0)))
+	_expect((joystick.call("movement") as Vector2).is_zero_approx(), "摇杆抬手后回中并清空移动输入")
+	_expect(movement_events.size() >= 2, "摇杆按下与抬手都通知运行时")
+	var gesture := TOUCH_CAMERA_GESTURE.new()
+	_expect(
+		not bool(gesture.consume(_mobile_touch(1, true, Vector2(100.0, 100.0))).get("handled", true)),
+		"单指起点保留给场景点击",
+	)
+	var pan := InputEventScreenDrag.new()
+	pan.index = 1
+	pan.position = Vector2(130.0, 100.0)
+	pan.relative = Vector2(30.0, 0.0)
+	var pan_result := gesture.consume(pan)
+	_expect_equal(pan_result.get("pan"), Vector2(30.0, 0.0), "单指拖动输出镜头平移")
+	gesture.consume(_mobile_touch(1, false, pan.position))
+	var input := MOBILE_MOVEMENT_INPUT.new()
+	input.set_value(Vector2(0.8, 0.0))
+	_expect_equal(input.merged_with(Vector2.ZERO), Vector2(0.8, 0.0), "触控移动输入在物理输入为空时生效")
+	_expect_equal(input.merged_with(Vector2(1.0, 0.0)), Vector2(1.0, 0.0), "物理输入优先于较弱触控输入")
+	joystick.queue_free()
+	await process_frame
+
+
+func _verify_mobile_page_layout_assets() -> void:
+	for asset_path: String in [
+		"res://assets/ui/resident_detail/runtime/resident_detail_background_transparent_v1.png",
+		"res://assets/ui/resident_detail/runtime/relationship_page_transparent_v1.png",
+		"res://assets/ui/resident_detail/runtime/memory_page_transparent_v1.png",
+		"res://assets/ui/resident_detail/runtime/memory_operation_page_transparent_v1.png",
+	]:
+		_expect(FileAccess.file_exists(asset_path), "居民详情移动端透明页面资产已进入正式资源目录")
+	var loading_source := FileAccess.get_file_as_string(
+		"res://ui/startup/TownEntryLoadingOverlay.gd"
+	)
+	_expect(
+		loading_source.contains("TextureRect.STRETCH_KEEP_ASPECT_COVERED"),
+		"进入小镇加载底图按比例覆盖完整视口",
+	)
+	_expect(
+		loading_source.contains("AUTO_PROGRESS_CAP := 0.92"),
+		"进入小镇加载进度会自动推进到等待上限",
+	)
+	var overview_source := FileAccess.get_file_as_string(
+		"res://ui/resident_overview/ResidentOverviewScreen.gd"
+	)
+	_expect(
+		overview_source.contains("MOBILE_VISIBLE_ROSTER_ROWS := 7"),
+		"居民总览移动端一次显示七个可滑动条目",
+	)
+	var hud_source := FileAccess.get_file_as_string(
+		"res://ui/town/hud/runtime/TownHudOverlay.gd"
+	)
+	_expect(
+		hud_source.contains("MOBILE_LEFT_RAIL_RECT")
+			and hud_source.contains("MOBILE_RIGHT_RAIL_RECT"),
+		"移动端 HUD 左右导轨使用独立比例锁定组件",
+	)
+	_expect(
+		hud_source.contains("mobile_time_component")
+			and hud_source.contains("mobile_avatar_component"),
+		"移动端 HUD 时间与化身区域不随宽屏横向拉伸",
+	)
+	_expect(
+		hud_source.contains("STRETCH_KEEP_ASPECT_CENTERED")
+			and hud_source.contains("MOBILE_TOP_FRAME_BAND_RECT"),
+		"移动端 HUD 仅让空白边带延展并保持图标比例",
+	)
+
+
+func _mobile_touch(index: int, pressed: bool, position: Vector2) -> InputEventScreenTouch:
+	var event := InputEventScreenTouch.new()
+	event.index = index
+	event.pressed = pressed
+	event.position = position
+	return event
+
+
+func _scenario_dynamic_feedback_text_is_complete() -> void:
+	var long_system_message := (
+		"上次保存未完成，系统已经恢复最近一份完整存档。请先检查居民状态、"
+		+ "当前地点和模型连接，再决定是否继续刚才的操作。"
+	)
+	var toast := SYSTEM_FEEDBACK_TOAST_SCENE.instantiate() as Control
+	toast.set_anchors_and_offsets_preset(Control.PRESET_TOP_LEFT)
+	toast.size = Vector2(560, 115)
+	toast.set("expanded", false)
+	root.add_child(toast)
+	await process_frame
+	var feedback_issues := toast.call("configure", {
+		"scope": "save",
+		"status": "ready",
+		"revision": 1,
+		"data": {
+			"source": "runtime",
+			"capabilityMode": "formal",
+			"formalReady": true,
+			"feedback": {
+				"feedbackId": "long-system-feedback-test",
+				"component": "toast",
+				"tone": "warning",
+				"title": "已恢复完整存档",
+				"message": long_system_message,
+				"blocking": false,
+				"dismissPolicy": "auto_or_manual",
+				"durationMsec": 3000,
+			},
+		},
+		"actions": {},
+		"operation": {"status": "idle", "requestId": ""},
+		"error": null,
+	}, "toast") as PackedStringArray
+	_expect(feedback_issues.is_empty(), "长系统反馈可应用到紧凑提示框")
+	await process_frame
+	var toast_snapshot := toast.call("runtime_text_snapshot") as Dictionary
+	var toast_pages := toast_snapshot.get("pages", []) as Array
+	_expect(toast_pages.size() > 1, "紧凑横屏系统反馈会完整分页")
+	_expect_equal(
+		"".join(toast_pages),
+		"已恢复完整存档：%s" % long_system_message,
+		"系统反馈分页保留标题和完整正文",
+	)
+	_expect_equal(
+		toast_snapshot.get("overrun"),
+		TextServer.OVERRUN_NO_TRIMMING,
+		"系统反馈页不再静默裁字或显示省略号",
+	)
+	_expect_equal(
+		toast_snapshot.get("visibleLines"),
+		1,
+		"紧凑横屏系统反馈当前页实际完整显示一行",
+	)
+	toast.call("_process", 2.6)
+	_expect_equal(
+		(toast.call("runtime_text_snapshot") as Dictionary).get("pageIndex"),
+		1,
+		"系统反馈会轮播到后续正文页",
+	)
+	_expect(
+		int(toast.call("minimum_read_duration_msec")) > 3000,
+		"自动提示会为全部正文页保留阅读时间",
+	)
+	toast.free()
+
+	var long_avatar_message := (
+		"当前目标离开了可交互范围，路径也被临时占用，请重新靠近目标后再试。"
+	)
+	var avatar_hud := AVATAR_HUD_SCENE.instantiate() as Control
+	avatar_hud.set_anchors_and_offsets_preset(Control.PRESET_TOP_LEFT)
+	avatar_hud.size = Vector2(1280, 720)
+	root.add_child(avatar_hud)
+	await process_frame
+	avatar_hud.call("configure", {
+		"avatar": {
+			"scope": "avatar",
+			"status": "ready",
+			"revision": 1,
+			"data": {
+				"source": "runtime",
+				"capabilityMode": "formal",
+				"formalReady": true,
+				"mode": "avatar_active",
+			},
+			"actions": {
+				"retry": {
+					"intent": "avatar.retry",
+					"enabled": true,
+					"disabledReason": "",
+				},
+			},
+			"operation": {
+				"status": "error",
+				"requestId": "avatar-long-error",
+				"intent": "avatar.interact",
+			},
+			"error": {"code": "TARGET_UNREACHABLE", "message": long_avatar_message},
+		},
+		"conversation": {
+			"scope": "conversation",
+			"status": "ready",
+			"revision": 1,
+			"data": {"conversationId": "", "displayMode": "player"},
+			"actions": {},
+			"operation": {"status": "idle", "requestId": ""},
+			"error": null,
+		},
+	}, {"inputMode": "keyboard_mouse"})
+	await process_frame
+	await process_frame
+	var avatar_feedback := avatar_hud.call("operation_feedback_snapshot") as Dictionary
+	var avatar_pages := avatar_feedback.get("pages", []) as Array
+	_expect(avatar_pages.size() > 1, "化身长错误会拆成多个两行反馈页")
+	_expect_equal(
+		"".join(avatar_pages),
+		long_avatar_message + "　R 重试",
+		"化身错误分页保留完整原因和重试提示",
+	)
+	_expect_equal(
+		avatar_feedback.get("maxLines"),
+		2,
+		"化身反馈每页保持两行可见区域",
+	)
+	_expect_equal(
+		avatar_feedback.get("overrun"),
+		TextServer.OVERRUN_NO_TRIMMING,
+		"化身反馈页不再用省略号吞掉重试提示",
+	)
+	var avatar_visible_lines := int(avatar_feedback.get("visibleLines", 0))
+	_expect(
+		avatar_visible_lines >= 1 and avatar_visible_lines <= 2,
+		"化身操作反馈当前页实际完整显示一至两行",
+	)
+	avatar_hud.call("_process", 2.1)
+	_expect_equal(
+		(avatar_hud.call("operation_feedback_snapshot") as Dictionary).get("pageIndex"),
+		1,
+		"化身操作反馈会显示下一页完整原因",
+	)
+	avatar_hud.free()
+
+	var provider_screen := PROVIDER_SETTINGS_SCREEN_SCENE.instantiate() as Control
+	provider_screen.set("_layout_profile", "phone_portrait")
+	provider_screen.set("_view_model", {
+		"actions": {},
+		"operation": {"status": "idle", "requestId": ""},
+		"error": null,
+	})
+	var long_provider_message := (
+		"模型服务已经返回响应，但当前模型名称与服务端可用列表不一致，"
+		+ "请检查连接地址、模型名称和访问权限后重新检查。"
+	)
+	var provider_panel := provider_screen.call("_build_status_section", {
+		"providerId": "deepseek",
+		"displayName": "DeepSeek",
+		"enabled": true,
+		"connection": {
+			"status": "unavailable",
+			"label": "连接失败",
+			"message": long_provider_message,
+		},
+	}) as Control
+	var provider_message_label: Label
+	for child: Node in provider_panel.find_children("*", "Label", true, false):
+		if String(child.get_meta("gate_id", "")) == "connection_status_message":
+			provider_message_label = child as Label
+			break
+	_expect(provider_message_label != null, "模型连接状态正文已创建")
+	if provider_message_label != null:
+		_expect_equal(provider_message_label.text, long_provider_message, "模型连接结果保留完整错误原文")
+		_expect_equal(provider_message_label.max_lines_visible, -1, "模型连接结果不再固定两行")
+		_expect_equal(
+			provider_message_label.text_overrun_behavior,
+			TextServer.OVERRUN_NO_TRIMMING,
+			"模型连接结果不再使用省略号裁切",
+		)
+		_expect(not provider_message_label.clip_text, "模型连接结果不再静默裁字")
+		_expect(
+			provider_message_label.custom_minimum_size.y > 60.0,
+			"紧凑布局会按长错误内容增加正文高度",
+		)
+	provider_panel.free()
+	provider_screen.free()
 
 
 func _verify_conversation_agent_dispatch_first_frame(runtime: Node) -> void:

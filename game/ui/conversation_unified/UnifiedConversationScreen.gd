@@ -1,6 +1,8 @@
 class_name UnifiedConversationScreen
 extends Control
 
+const MOBILE_UI_PROFILE := preload("res://ui/mobile/MobileUiProfile.gd")
+
 
 signal intent_requested(intent: StringName, payload: Dictionary)
 signal action_blocked(intent: StringName, reason: String)
@@ -713,6 +715,7 @@ func _render() -> void:
 	_render_header()
 	_rebuild_messages()
 	_render_composer()
+	MOBILE_UI_PROFILE.apply_mobile_typography(self, 22, 3, 34)
 	_apply_layout()
 
 
@@ -1573,7 +1576,7 @@ func _apply_layout() -> void:
 	_stage.scale = Vector2.ONE * scale_factor
 	_stage.position = Vector2(
 		floorf(viewport.x - BASE_SIZE.x * scale_factor - 16.0),
-		floorf((viewport.y - BASE_SIZE.y * scale_factor) * 0.5)
+		floorf((viewport.y - BASE_SIZE.y * scale_factor) * 0.5),
 	)
 
 
@@ -1871,6 +1874,14 @@ func _bubble_width(copy: String, identity_copy: String = "") -> float:
 		identity_width = float(
 			identity_copy.length() * PageTheme.SPEAKER_FONT_SIZE
 		)
+	# A line only slightly wider than the maximum used to wrap as “full line +
+	# one character”. Use the width of evenly distributed wrapped lines so the
+	# final visible line cannot collapse into a one-character tail.
+	if copy_width > BUBBLE_MAX_TEXT_WIDTH:
+		var wrapped_line_count := int(ceil(
+			copy_width / BUBBLE_MAX_TEXT_WIDTH
+		))
+		copy_width = ceil(copy_width / float(wrapped_line_count))
 	var measured_text_width := maxf(copy_width, identity_width)
 	return clampf(
 		measured_text_width + 52.0,

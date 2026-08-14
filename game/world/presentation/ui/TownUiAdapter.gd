@@ -78,6 +78,9 @@ const RESIDENT_WARDROBE_CATALOG_PATH := (
 const CONVERSATION_BUBBLE_PLAYBACK := preload(
 	"res://world/presentation/ui/TownConversationBubblePlayback.gd"
 )
+const HUD_TEXT_FONT := preload(
+	"res://assets/fonts/zheng_ge_dian_hei_16/ZhengGeDianHei-16.ttf"
+)
 
 var _runtime: Node
 var _runtime_head_anchor_call := Callable()
@@ -144,6 +147,7 @@ var _hud_place_directory_static_loaded := false
 var _hud_place_directory_signature: Array = []
 var _hud_place_directory_cache: Dictionary = {}
 var _avatar_poll_signature: Dictionary = {}
+var _avatar_perception_revision_pending := -1
 var _resident_portrait_by_id: Dictionary = {}
 var _resident_portrait_ref_by_id: Dictionary = {}
 var _resident_portraits_loaded := false
@@ -324,6 +328,7 @@ func bind_runtime(runtime: Node, world: RefCounted, gateway: Node, session_confi
 	_hud_place_directory_signature.clear()
 	_hud_place_directory_cache.clear()
 	_avatar_poll_signature.clear()
+	_avatar_perception_revision_pending = -1
 	_refresh_resident_identities()
 	_capture_current_hud_far_conversations()
 	_gateway_error_sequence = _latest_gateway_error_sequence(_gateway_errors())
@@ -342,6 +347,10 @@ func bind_runtime(runtime: Node, world: RefCounted, gateway: Node, session_confi
 		var speed_callable := Callable(self, "_on_simulation_speed_changed")
 		if not _world.is_connected("simulation_speed_changed", speed_callable):
 			_world.connect("simulation_speed_changed", speed_callable)
+	if _world != null and _world.has_signal("player_avatar_perception_changed"):
+		var perception_callable := _on_player_avatar_perception_changed
+		if not _world.is_connected("player_avatar_perception_changed", perception_callable):
+			_world.connect("player_avatar_perception_changed", perception_callable)
 	_connect_hud_activity_signals()
 	_refresh_all(true)
 	set_process(true)
@@ -905,6 +914,10 @@ func _disconnect_world() -> void:
 		var speed_callable := Callable(self, "_on_simulation_speed_changed")
 		if _world.is_connected("simulation_speed_changed", speed_callable):
 			_world.disconnect("simulation_speed_changed", speed_callable)
+	if _world.has_signal("player_avatar_perception_changed"):
+		var perception_callable := _on_player_avatar_perception_changed
+		if _world.is_connected("player_avatar_perception_changed", perception_callable):
+			_world.disconnect("player_avatar_perception_changed", perception_callable)
 	for binding in [
 		["lifecycle_state_changed", "_on_adapter_lifecycle_state_changed"],
 		["announcement_published", "_on_adapter_announcement_published"],
@@ -1009,6 +1022,19 @@ func _on_world_revision_changed(revision: int) -> void:
 	if revision < _world_revision:
 		return
 	_world_revision = revision
+	if (
+		_avatar_perception_revision_pending >= 0
+		and revision <= _avatar_perception_revision_pending
+	):
+		# A pure avatar-position perception update already rebuilt the avatar
+		# target cards above. It must not fan out into the expensive town HUD
+		# projection; minute/world changes carry a different source and still use
+		# the normal all-scope invalidation below.
+		_avatar_perception_revision_pending = -1
+		_dirty_world_scopes.erase("avatar")
+		_pending_world_refresh_scopes.erase("avatar")
+		return
+	_avatar_perception_revision_pending = -1
 	for scope in WORLD_SCOPES:
 		_dirty_world_scopes[scope] = true
 	# A game-minute tick may update many residents at once. Keep that work out
@@ -1016,6 +1042,16 @@ func _on_world_revision_changed(revision: int) -> void:
 	# following frames.
 	_queue_world_scope_refresh("environment")
 	_queue_world_scope_refresh("town_hud")
+
+
+func _on_player_avatar_perception_changed(change: Dictionary) -> void:
+	if String(change.get("source", "")) != "avatar_position":
+		return
+	_refresh_scope("avatar", true)
+	if bool(change.get("semanticStateChanged", false)):
+		return
+	_world_revision = maxi(_world_revision, _read_world_revision())
+	_avatar_perception_revision_pending = _world_revision
 
 
 func _on_conversation_changed(
@@ -1552,6 +1588,16 @@ func _build_avatar_view_model(operation: Dictionary, error: Dictionary) -> Dicti
 	var avatar_attack_animation_active := bool(
 		runtime_state.get("avatarConflictInputBlocked", false)
 	)
+	var animal_snapshot := runtime_state.get("animals", {}) as Dictionary
+	var can_pet_animal := (
+		mode == "avatar_active"
+		and not has_conversation
+		and not avatar_attack_animation_active
+		and bool(animal_snapshot.get("canInteract", false))
+		and not String(animal_snapshot.get("focusedAnimalId", "")).is_empty()
+		and _runtime != null
+		and _runtime.has_method("try_pet_nearest_animal_from_ui")
+	)
 	current_can_talk = current_can_talk and not avatar_attack_animation_active
 	can_switch_target = can_switch_target and not avatar_attack_animation_active
 	var attack_interface_available := (
@@ -1674,6 +1720,11 @@ func _build_avatar_view_model(operation: Dictionary, error: Dictionary) -> Dicti
 				),
 			),
 			"attackTarget": attack_action,
+			"petAnimal": _action(
+				"avatar.pet_animal",
+				can_pet_animal,
+				"NO_NEARBY_ANIMAL" if not can_pet_animal else "",
+			),
 			"exitMode": _action(
 				"avatar.exit_mode",
 				(
@@ -2995,17 +3046,50 @@ func _hud_public_thought_text(value: String) -> String:
 		normalized = normalized.replace(separator, " ")
 	while normalized.contains("  "):
 		normalized = normalized.replace("  ", " ")
-	const MAX_BUBBLE_TEXT_LENGTH := 18
-	if normalized.length() <= MAX_BUBBLE_TEXT_LENGTH:
+	const MAX_BUBBLE_DISPLAY_UNITS := 18.0
+	const ELLIPSIS_DISPLAY_UNITS := 1.0
+	if _hud_text_display_units(normalized) <= MAX_BUBBLE_DISPLAY_UNITS:
 		return normalized
-	for separator: String in ["。", "！", "？", "；"]:
-		var separator_index := normalized.find(separator)
-		if (
-			separator_index >= 3
-			and separator_index < MAX_BUBBLE_TEXT_LENGTH
-		):
-			return normalized.left(separator_index + 1)
-	return normalized.left(MAX_BUBBLE_TEXT_LENGTH - 1) + "…"
+	var content_limit := MAX_BUBBLE_DISPLAY_UNITS - ELLIPSIS_DISPLAY_UNITS
+	var split_at := _hud_prefix_length_for_display_units(
+		normalized,
+		content_limit,
+	)
+	var prefix := normalized.left(split_at).strip_edges()
+	return prefix if prefix.ends_with("…") else prefix + "…"
+
+
+func _hud_prefix_length_for_display_units(
+	value: String,
+	max_units: float,
+) -> int:
+	var units := 0.0
+	for index: int in value.length():
+		var next_units := units + _hud_character_display_units(value, index)
+		if next_units > max_units:
+			return index
+		units = next_units
+	return value.length()
+
+
+func _hud_text_display_units(value: String) -> float:
+	var units := 0.0
+	for index: int in value.length():
+		units += _hud_character_display_units(value, index)
+	return units
+
+
+func _hud_character_display_units(value: String, index: int) -> float:
+	var character := value.substr(index, 1)
+	return maxf(
+		0.5,
+		HUD_TEXT_FONT.get_string_size(
+			character,
+			HORIZONTAL_ALIGNMENT_LEFT,
+			-1.0,
+			20,
+		).x / 20.0,
+	)
 
 
 func _hud_public_thought_before(left: Dictionary, right: Dictionary) -> bool:
@@ -4557,6 +4641,10 @@ func _execute_avatar_intent(intent: String, payload: Dictionary) -> Dictionary:
 			return _focus_nearby_target(payload)
 		"avatar.attack_target":
 			return _attack_avatar_target(payload)
+		"avatar.pet_animal":
+			var town_runtime := _runtime as AiTownRuntime
+			if is_instance_valid(town_runtime):
+				return _normalize_command_result(town_runtime.try_pet_nearest_animal_from_ui())
 		"avatar.enter_mode":
 			if _runtime != null and _runtime.has_method("enter_avatar_mode"):
 				return _normalize_command_result(_runtime.call("enter_avatar_mode"))

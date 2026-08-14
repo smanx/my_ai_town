@@ -1,12 +1,15 @@
 extends Control
 
 signal intent_requested(intent: String, payload: Dictionary)
+signal movement_input_changed(value: Vector2)
 
 const UI_SIGNALS := preload(
 	"res://ui/common/AiTownUiSignals.gd"
 )
 const UI_VIEW_MODEL := preload("res://ui/common/AiTownUiViewModel.gd")
 const UI_NODE_RETIREMENT := preload("res://ui/common/AiTownUiNodeRetirement.gd")
+const MOBILE_UI_PROFILE := preload("res://ui/mobile/MobileUiProfile.gd")
+const VIRTUAL_JOYSTICK := preload("res://ui/mobile/VirtualJoystick.gd")
 const REQUIRED_ADAPTER_SCOPES := ["avatar", "conversation"]
 const TIME_HUD_SCOPE := "town_hud"
 
@@ -93,6 +96,16 @@ const SKILL_SLOT_CENTERS := [47.0, 119.0, 191.0, 263.0]
 const SKILL_ART_SIZE := Vector2(58, 58)
 const SKILL_BUTTON_SIZE := Vector2(68, 68)
 const SKILL_KEY_SIZE := Vector2(20, 20)
+const MOBILE_JOYSTICK_BASE_PATH := "res://assets/ui/avatar_mode/runtime/mobile_joystick/mobile_joystick_base_v2.png"
+const MOBILE_JOYSTICK_KNOB_PATH := "res://assets/ui/avatar_mode/runtime/mobile_joystick/mobile_joystick_knob_v2.png"
+const MOBILE_TALK_ACTION_PATH := "res://assets/ui/avatar_mode/runtime/mobile_context_actions/mobile_talk_action_v1.png"
+const MOBILE_PET_CAT_ACTION_PATH := "res://assets/ui/avatar_mode/runtime/mobile_context_actions/mobile_pet_cat_action_v1.png"
+const TOUCH_JOYSTICK_MIN_SIZE := 276.0
+const TOUCH_JOYSTICK_MAX_SIZE := 336.0
+const TOUCH_SKILLBAR_SIZE := Vector2(496.0, 138.0)
+const MOBILE_CONTEXT_ACTION_SIZE := Vector2(144.0, 144.0)
+const MOBILE_PET_ACTION_SIZE := Vector2(224.0, 224.0)
+const MOBILE_CONTEXT_ACTION_GAP := 16.0
 const OBSERVER_SHELL_TEXTURE := preload(
 	"res://assets/ui/town/hud/runtime/composite/"
 	+ "observer_hud_v5_time_panel_detached_v6_rgba.png"
@@ -183,6 +196,10 @@ var _attack_button_disabled: Texture2D
 var _attack_skill_textures: Dictionary = {}
 var _nearby_talk_prompt_shell: Texture2D
 var _skillbar_shell: Texture2D
+var _mobile_joystick_base: Texture2D
+var _mobile_joystick_knob: Texture2D
+var _mobile_talk_action: Texture2D
+var _mobile_pet_cat_action: Texture2D
 var _component_nodes: Dictionary = {}
 var _text_nodes: Dictionary = {}
 var _intent_nodes: Dictionary = {}
@@ -204,7 +221,17 @@ var _movement_hint_dismissed := false
 var _feedback_active_key := ""
 var _feedback_hidden_key := ""
 var _feedback_expire_at_msec := 0
+const FEEDBACK_PAGE_DURATION_SECONDS := 2.0
+const FEEDBACK_PAGE_MAX_UNITS := 30.0
+const FEEDBACK_LINE_MAX_UNITS := 15.0
+var _feedback_pages: Array[String] = []
+var _feedback_page_index := 0
+var _feedback_page_elapsed := 0.0
+var _feedback_full_text := ""
 var _time_control_panel_face: TextureRect
+var _touch_joystick: AiTownVirtualJoystick
+var _touch_movement := Vector2.ZERO
+var _rebuild_after_joystick_release := false
 
 
 func _ready() -> void:
@@ -216,18 +243,39 @@ func _ready() -> void:
 	_build_runtime_theme()
 	_load_runtime_assets()
 	resized.connect(_layout_runtime)
-	_rebuild()
+	_request_rebuild_preserving_joystick()
 
 
 func _fit_root_to_viewport() -> void:
 	# The formal HUD is mounted directly below TownRuntime (Node2D). Anchors
 	# alone therefore resolve to a zero-sized rectangle.
 	position = Vector2.ZERO
-	size = get_viewport_rect().size
+	var parent_control := get_parent() as Control
+	size = (
+		parent_control.size
+		if is_instance_valid(parent_control)
+		and parent_control.size.x > 0.0
+		and parent_control.size.y > 0.0
+		else get_viewport_rect().size
+	)
+	_fixture["inputMode"] = MOBILE_UI_PROFILE.input_mode(size)
+	_fixture["safeInsets"] = MOBILE_UI_PROFILE.safe_insets(size, get_window())
+	_fixture["copyScale"] = 1.15 if MOBILE_UI_PROFILE.is_phone_landscape(size) else 1.0
 
 
 func _exit_tree() -> void:
+	_set_touch_movement(Vector2.ZERO)
 	_disconnect_adapter()
+
+
+func set_mobile_fixture(viewport_size: Vector2) -> void:
+	if viewport_size.x > 0.0 and viewport_size.y > 0.0:
+		size = viewport_size
+	_fixture["inputMode"] = MOBILE_UI_PROFILE.input_mode(viewport_size)
+	_fixture["safeInsets"] = MOBILE_UI_PROFILE.safe_insets(viewport_size, get_window())
+	_fixture["copyScale"] = 1.15 if MOBILE_UI_PROFILE.is_phone_landscape(viewport_size) else 1.0
+	if is_node_ready():
+		_request_rebuild_preserving_joystick()
 
 
 func _input(event: InputEvent) -> void:
@@ -273,10 +321,11 @@ func _input(event: InputEvent) -> void:
 		get_viewport().set_input_as_handled()
 
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if not is_visible_in_tree():
 		return
 	_sync_live_resident_prompt_anchor()
+	_update_operation_feedback_page(delta)
 	if (
 		_feedback_expire_at_msec <= 0
 		or Time.get_ticks_msec() < _feedback_expire_at_msec
@@ -284,7 +333,7 @@ func _process(_delta: float) -> void:
 		return
 	_feedback_hidden_key = _feedback_active_key
 	_feedback_expire_at_msec = 0
-	_rebuild()
+	_request_rebuild_preserving_joystick()
 
 
 func configure(view_models: Dictionary, fixture: Dictionary) -> void:
@@ -322,7 +371,7 @@ func configure(view_models: Dictionary, fixture: Dictionary) -> void:
 		)
 	_configured = true
 	if is_node_ready():
-		_rebuild()
+		_request_rebuild_preserving_joystick()
 
 
 func bind_town_ui_adapter(adapter: Node) -> PackedStringArray:
@@ -374,7 +423,7 @@ func bind_town_ui_adapter(adapter: Node) -> PackedStringArray:
 		_apply_time_hud_view_model(town_hud_incoming as Dictionary)
 	_binding_batch = false
 	if is_node_ready():
-		_rebuild()
+		_request_rebuild_preserving_joystick()
 	return issues
 
 
@@ -390,7 +439,7 @@ func unbind_town_ui_adapter() -> void:
 	_adapter_contract_gaps.clear()
 	_last_dispatch_result.clear()
 	if is_node_ready():
-		_rebuild()
+		_request_rebuild_preserving_joystick()
 
 
 func apply_view_model(view_model: Dictionary) -> PackedStringArray:
@@ -455,7 +504,7 @@ func apply_view_model(view_model: Dictionary) -> PackedStringArray:
 			visible = false
 			mouse_filter = Control.MOUSE_FILTER_IGNORE
 		else:
-			_rebuild()
+			_request_rebuild_preserving_joystick()
 	return issues
 
 
@@ -528,7 +577,7 @@ func _apply_time_hud_view_model(view_model: Dictionary) -> PackedStringArray:
 	_view_models[TIME_HUD_SCOPE] = render_snapshot
 	_revision_by_scope[TIME_HUD_SCOPE] = incoming_revision
 	if is_node_ready() and not _binding_batch and not _conversation_open():
-		_rebuild()
+		_request_rebuild_preserving_joystick()
 	return PackedStringArray()
 
 
@@ -732,6 +781,13 @@ func get_text_rects() -> Array:
 					"id": text_id,
 					"text": node.text,
 					"fontSize": node.get_theme_font_size("font_size"),
+					"fullText": String(node.get_meta("full_text", node.text)),
+					"maxLines": node.max_lines_visible,
+					"lineCount": node.get_line_count(),
+					"visibleLineCount": node.get_visible_line_count(),
+					"overrun": node.text_overrun_behavior,
+					"pageCount": int(node.get_meta("page_count", 1)),
+					"pageIndex": int(node.get_meta("page_index", 0)),
 					"rect": [
 						local_position.x,
 						local_position.y,
@@ -741,6 +797,23 @@ func get_text_rects() -> Array:
 				}
 			)
 	return rects
+
+
+func operation_feedback_snapshot() -> Dictionary:
+	var label := _text_nodes.get("operation_feedback_label") as Label
+	return {
+		"fullText": _feedback_full_text,
+		"pages": _feedback_pages.duplicate(),
+		"pageIndex": _feedback_page_index,
+		"visibleText": label.text if label != null else "",
+		"maxLines": label.max_lines_visible if label != null else 0,
+		"visibleLines": label.get_visible_line_count() if label != null else 0,
+		"overrun": (
+			label.text_overrun_behavior
+			if label != null
+			else TextServer.OVERRUN_NO_TRIMMING
+		),
+	}
 
 
 func get_portrait_rects() -> Array:
@@ -874,8 +947,13 @@ func _rebuild() -> void:
 	if not disabled:
 		_build_exit_panel(avatar)
 	if not disabled:
-		_build_context_prompts(data)
+		if str(_fixture.get("inputMode", "keyboard_mouse")) == "touch":
+			_build_touch_joystick()
+		else:
+			_build_context_prompts(data)
 		_build_skillbar(data, avatar)
+		if str(_fixture.get("inputMode", "keyboard_mouse")) == "touch":
+			_build_mobile_context_actions(data, avatar)
 	_build_operation_feedback(avatar)
 	_layout_runtime()
 	_configure_focus_chain()
@@ -930,6 +1008,10 @@ func _load_runtime_assets() -> void:
 		}
 	_nearby_talk_prompt_shell = load(NEARBY_TALK_PROMPT_SHELL_PATH) as Texture2D
 	_skillbar_shell = load(SKILLBAR_SHELL_PATH) as Texture2D
+	_mobile_joystick_base = load(MOBILE_JOYSTICK_BASE_PATH) as Texture2D
+	_mobile_joystick_knob = load(MOBILE_JOYSTICK_KNOB_PATH) as Texture2D
+	_mobile_talk_action = load(MOBILE_TALK_ACTION_PATH) as Texture2D
+	_mobile_pet_cat_action = load(MOBILE_PET_CAT_ACTION_PATH) as Texture2D
 
 
 func _load_atlas_parts(
@@ -1268,6 +1350,7 @@ func _build_nearby_talk_prompt(
 	add_child(root)
 	_add_intent_button(root, action, "resident_prompt", action_payload)
 	var key := _new_label("resident_prompt_key", "E", 18, INK)
+	key.visible = str(_fixture.get("inputMode", "keyboard_mouse")) != "touch"
 	key.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	key.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 	root.add_child(key)
@@ -1287,6 +1370,7 @@ func _build_nearby_talk_prompt(
 
 
 func _build_skillbar(data: Dictionary, avatar: Dictionary) -> void:
+	var touch_mode := str(_fixture.get("inputMode", "keyboard_mouse")) == "touch"
 	var root := TextureRect.new()
 	root.name = "AvatarSkillbar"
 	root.texture = _skillbar_shell
@@ -1344,7 +1428,7 @@ func _build_skillbar(data: Dictionary, avatar: Dictionary) -> void:
 				if bool(action.get("enabled", false))
 				else _attack_prompt_copy(action)
 			)
-			if not button.disabled:
+			if not button.disabled and not touch_mode:
 				button.mouse_entered.connect(
 					func() -> void: skill_art.texture = textures.get("hover") as Texture2D
 				)
@@ -1357,7 +1441,7 @@ func _build_skillbar(data: Dictionary, avatar: Dictionary) -> void:
 				button.button_up.connect(
 					func() -> void:
 						skill_art.texture = textures.get(
-							"hover" if button.is_hovered() else "normal",
+							"normal" if touch_mode else ("hover" if button.is_hovered() else "normal"),
 						) as Texture2D
 				)
 		var key := _new_label(
@@ -1372,7 +1456,71 @@ func _build_skillbar(data: Dictionary, avatar: Dictionary) -> void:
 		key.add_theme_constant_override("outline_size", 3)
 		key.position = Vector2(slot_center_x + 15, 56)
 		key.size = SKILL_KEY_SIZE
+		key.visible = not touch_mode
 		root.add_child(key)
+
+
+func _build_mobile_context_actions(data: Dictionary, avatar: Dictionary) -> void:
+	var entries: Array[Dictionary] = []
+	for target_value: Variant in data.get("contextTargets", []) as Array:
+		if not target_value is Dictionary:
+			continue
+		var target := target_value as Dictionary
+		if String(target.get("kind", "")) != "resident":
+			continue
+		var talk_action := target.get("primaryAction", {}) as Dictionary
+		if bool(talk_action.get("enabled", false)):
+			entries.append({
+				"id": "touch_talk_action",
+				"texture": _mobile_talk_action,
+				"size": MOBILE_CONTEXT_ACTION_SIZE,
+				"action": talk_action,
+				"payload": _target_action_payload(target),
+			})
+		break
+	var actions := avatar.get("actions", {}) as Dictionary
+	var pet_action := actions.get("petAnimal", {}) as Dictionary
+	if bool(pet_action.get("enabled", false)):
+		entries.append({
+			"id": "touch_pet_action",
+			"texture": _mobile_pet_cat_action,
+			"size": MOBILE_PET_ACTION_SIZE,
+			"action": pet_action,
+			"payload": {},
+		})
+	if entries.is_empty():
+		return
+	var root := Control.new()
+	root.name = "MobileContextActions"
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var total_width := 0.0
+	var maximum_height := 0.0
+	for entry: Dictionary in entries:
+		var entry_size := entry.get("size", MOBILE_CONTEXT_ACTION_SIZE) as Vector2
+		total_width += entry_size.x
+		maximum_height = maxf(maximum_height, entry_size.y)
+	total_width += MOBILE_CONTEXT_ACTION_GAP * maxi(0, entries.size() - 1)
+	root.size = Vector2(total_width, maximum_height)
+	_register_component("mobile_context_actions", root)
+	add_child(root)
+	for entry_index: int in entries.size():
+		var entry := entries[entry_index]
+		var action_id := String(entry.get("id", ""))
+		var slot := TextureRect.new()
+		slot.name = "%sSlot" % action_id.to_pascal_case()
+		var entry_size := entry.get("size", MOBILE_CONTEXT_ACTION_SIZE) as Vector2
+		var entry_x := 0.0
+		for previous_index: int in entry_index:
+			entry_x += (entries[previous_index].get("size", MOBILE_CONTEXT_ACTION_SIZE) as Vector2).x + MOBILE_CONTEXT_ACTION_GAP
+		slot.position = Vector2(entry_x, root.size.y - entry_size.y)
+		slot.size = entry_size
+		slot.texture = entry.get("texture") as Texture2D
+		slot.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		slot.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		slot.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+		slot.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		root.add_child(slot)
+		_add_intent_button(slot, entry.get("action", {}) as Dictionary, action_id, entry.get("payload", {}) as Dictionary)
 
 
 func _skillbar_child_rects() -> Array[Dictionary]:
@@ -1520,21 +1668,52 @@ func _build_gamepad_movement() -> void:
 
 
 func _build_touch_joystick() -> void:
-	var root := Control.new()
+	var root := VIRTUAL_JOYSTICK.new() as AiTownVirtualJoystick
 	root.name = "TouchJoystick"
-	root.mouse_filter = Control.MOUSE_FILTER_PASS
+	root.mouse_filter = Control.MOUSE_FILTER_STOP
 	_register_component("touch_joystick", root)
 	add_child(root)
-	var base := _new_control_part(3, Vector2(144, 144), "touch_joystick_base")
-	base.position = Vector2(8, 8)
+	var base := TextureRect.new()
+	base.name = "TouchJoystickBase"
+	base.texture = _mobile_joystick_base
+	base.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	base.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	base.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	base.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	base.modulate = Color(1.0, 1.0, 1.0, 0.34)
 	root.add_child(base)
-	var knob := _new_control_part(4, Vector2(76, 76), "touch_joystick_knob")
-	knob.position = Vector2(42, 42)
+	var knob := TextureRect.new()
+	knob.name = "TouchJoystickKnob"
+	knob.texture = _mobile_joystick_knob
+	knob.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	knob.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	knob.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	knob.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	knob.modulate = Color(1.0, 1.0, 1.0, 0.52)
 	root.add_child(knob)
-	var label := _new_label("move_label", "拖动移动", 24, INK)
-	label.position = Vector2(166, 58)
-	label.size = Vector2(130, 48)
-	root.add_child(label)
+	root.configure(knob)
+	root.movement_changed.connect(_set_touch_movement)
+	_touch_joystick = root
+
+
+func _set_touch_movement(value: Vector2) -> void:
+	if _touch_movement.is_equal_approx(value):
+		if value.is_zero_approx() and _rebuild_after_joystick_release:
+			_rebuild_after_joystick_release = false
+			_rebuild.call_deferred()
+		return
+	_touch_movement = value
+	movement_input_changed.emit(_touch_movement)
+	if value.is_zero_approx() and _rebuild_after_joystick_release:
+		_rebuild_after_joystick_release = false
+		_rebuild.call_deferred()
+
+
+func _request_rebuild_preserving_joystick() -> void:
+	if is_instance_valid(_touch_joystick) and _touch_joystick.is_pointer_active():
+		_rebuild_after_joystick_release = true
+		return
+	_rebuild()
 
 
 func _build_portrait_slot(
@@ -1667,7 +1846,11 @@ func _build_operation_feedback(avatar: Dictionary) -> void:
 			_feedback_active_key = ""
 			_feedback_hidden_key = ""
 			_feedback_expire_at_msec = 0
-		return
+			_feedback_pages.clear()
+			_feedback_page_index = 0
+			_feedback_page_elapsed = 0.0
+			_feedback_full_text = ""
+			return
 	var error_value: Variant = avatar.get("error", {})
 	var error: Dictionary = {}
 	if error_value is Dictionary:
@@ -1683,9 +1866,22 @@ func _build_operation_feedback(avatar: Dictionary) -> void:
 	if feedback_key != _feedback_active_key:
 		_feedback_active_key = feedback_key
 		_feedback_hidden_key = ""
+		_feedback_full_text = message
+		_feedback_pages = _split_feedback_pages(message)
+		_feedback_page_index = 0
+		_feedback_page_elapsed = 0.0
 		var lifetime_msec := 0
 		if status in ["success", "rejected", "error"]:
 			lifetime_msec = 1800 if status == "success" else 4000
+		if _feedback_pages.size() > 1:
+			lifetime_msec = maxi(
+				lifetime_msec,
+				int(ceil(
+					_feedback_pages.size()
+					* FEEDBACK_PAGE_DURATION_SECONDS
+					* 1000.0
+				)) + 500,
+			)
 		_feedback_expire_at_msec = (
 			Time.get_ticks_msec() + lifetime_msec
 			if lifetime_msec > 0
@@ -1700,6 +1896,17 @@ func _build_operation_feedback(avatar: Dictionary) -> void:
 				message += "　A 重试"
 			_:
 				message += "　R 重试"
+	if message != _feedback_full_text:
+		_feedback_full_text = message
+		_feedback_pages = _split_feedback_pages(message)
+		_feedback_page_index = 0
+		_feedback_page_elapsed = 0.0
+		if status in ["rejected", "error"] and _feedback_pages.size() > 1:
+			_feedback_expire_at_msec = Time.get_ticks_msec() + int(ceil(
+				_feedback_pages.size()
+				* FEEDBACK_PAGE_DURATION_SECONDS
+				* 1000.0
+			)) + 500
 	var panel := _new_section_frame(
 		"operation_feedback",
 		"ui.avatar-mode.basic-ninepatch.primary-frame",
@@ -1708,18 +1915,144 @@ func _build_operation_feedback(avatar: Dictionary) -> void:
 	if bool(retry_action.get("enabled", false)):
 		_add_intent_button(panel, retry_action, "retry")
 	panel.set_meta("feedback_status", status)
-	var label := _new_label("operation_feedback_label", message, 24, ink)
+	var visible_message := (
+		_balanced_feedback_lines(_feedback_pages[_feedback_page_index])
+		if not _feedback_pages.is_empty()
+		else message
+	)
+	var label := _new_label("operation_feedback_label", visible_message, 24, ink)
 	label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	label.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
 	label.max_lines_visible = 2
-	label.text_overrun_behavior = TextServer.OVERRUN_TRIM_ELLIPSIS
+	label.text_overrun_behavior = TextServer.OVERRUN_NO_TRIMMING
+	label.tooltip_text = _feedback_full_text
+	label.set_meta("full_text", _feedback_full_text)
+	label.set_meta("page_count", _feedback_pages.size())
+	label.set_meta("page_index", _feedback_page_index)
 	panel.add_child(label)
+
+
+func _update_operation_feedback_page(delta: float) -> void:
+	if _feedback_pages.size() <= 1:
+		return
+	_feedback_page_elapsed += delta
+	var next_index := int(floor(
+		_feedback_page_elapsed / FEEDBACK_PAGE_DURATION_SECONDS
+	)) % _feedback_pages.size()
+	if next_index == _feedback_page_index:
+		return
+	_feedback_page_index = next_index
+	var label := _text_nodes.get("operation_feedback_label") as Label
+	if label == null:
+		return
+	label.text = _balanced_feedback_lines(_feedback_pages[_feedback_page_index])
+	label.set_meta("page_index", _feedback_page_index)
+
+
+func _split_feedback_pages(value: String) -> Array[String]:
+	var normalized := _normalize_feedback_text(value)
+	var pages: Array[String] = []
+	var remaining := normalized
+	while _feedback_display_units(remaining) > FEEDBACK_PAGE_MAX_UNITS:
+		var remaining_units := _feedback_display_units(remaining)
+		var page_count := int(ceil(
+			remaining_units / FEEDBACK_PAGE_MAX_UNITS
+		))
+		var split_at := _feedback_split_index(
+			remaining,
+			remaining_units / float(page_count),
+			FEEDBACK_PAGE_MAX_UNITS,
+		)
+		pages.append(remaining.left(split_at).strip_edges())
+		remaining = remaining.substr(split_at).strip_edges()
+	if not remaining.is_empty():
+		pages.append(remaining)
+	return pages
+
+
+func _balanced_feedback_lines(value: String) -> String:
+	var units := _feedback_display_units(value)
+	if units <= FEEDBACK_LINE_MAX_UNITS:
+		return value
+	var split_at := _feedback_split_index(
+		value,
+		units / 2.0,
+		FEEDBACK_LINE_MAX_UNITS,
+	)
+	return "%s\n%s" % [
+		value.left(split_at).strip_edges(),
+		value.substr(split_at).strip_edges(),
+	]
+
+
+func _feedback_split_index(
+	value: String,
+	target_units: float,
+	max_units: float,
+) -> int:
+	const BREAKS := "。！？!?；;，,、：: "
+	var minimum_units := maxf(2.0, target_units * 0.6)
+	var units := 0.0
+	var fallback := 1
+	var fallback_distance := INF
+	var best := -1
+	var best_score := INF
+	for index: int in value.length():
+		var next_units := units + _feedback_character_units(value, index)
+		if next_units > max_units:
+			break
+		units = next_units
+		var distance := absf(units - target_units)
+		if distance <= fallback_distance:
+			fallback_distance = distance
+			fallback = index + 1
+		var character := value.substr(index, 1)
+		if units < minimum_units or not BREAKS.contains(character):
+			continue
+		if _feedback_display_units(value.substr(index + 1)) < minimum_units:
+			continue
+		var score := distance - (2.0 if "。！？!?；;".contains(character) else 0.5)
+		if score < best_score:
+			best_score = score
+			best = index + 1
+	return best if best >= 0 else fallback
+
+
+func _normalize_feedback_text(value: String) -> String:
+	var normalized := value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+	while normalized.contains("  "):
+		normalized = normalized.replace("  ", " ")
+	return normalized.strip_edges()
+
+
+func _feedback_display_units(value: String) -> float:
+	var units := 0.0
+	for index: int in value.length():
+		units += _feedback_character_units(value, index)
+	return units
+
+
+func _feedback_character_units(value: String, index: int) -> float:
+	var character := value.substr(index, 1)
+	if _font != null:
+		return maxf(
+			0.5,
+			_font.get_string_size(
+				character,
+				HORIZONTAL_ALIGNMENT_LEFT,
+				-1.0,
+				24,
+			).x / 24.0,
+		)
+	return 1.0 if value.unicode_at(index) > 0x2E7F else 0.5
 
 
 func _layout_runtime() -> void:
 	if not is_node_ready() or _component_nodes.is_empty():
 		return
 	var safe := _safe_rect()
+	if safe.size.x <= 0.0 or safe.size.y <= 0.0:
+		return
 	var copy_scale := clampf(float(_fixture.get("copyScale", 1.0)), 1.0, 1.3)
 	var avatar: Dictionary = _view_models.get("avatar", {})
 	var data: Dictionary = avatar.get("data", {})
@@ -1748,7 +2081,29 @@ func _layout_runtime() -> void:
 			exit_size
 		)
 	_layout_time_hud(safe)
-	var skillbar_size := Vector2(310, 86)
+	var touch_mode := str(_fixture.get("inputMode", "keyboard_mouse")) == "touch"
+	var joystick_size := (
+		minf(TOUCH_JOYSTICK_MAX_SIZE, maxf(TOUCH_JOYSTICK_MIN_SIZE, safe.size.y * 0.46))
+		if touch_mode
+		else minf(168.0, maxf(132.0, safe.size.y * 0.28))
+	)
+	_place(
+		"touch_joystick",
+		Vector2(safe.position.x + 4.0, safe.end.y - joystick_size - 4.0),
+		Vector2.ONE * joystick_size,
+	)
+	if is_instance_valid(_touch_joystick):
+		_touch_joystick.visible = touch_mode
+		var base := _touch_joystick.get_node_or_null("TouchJoystickBase") as Control
+		var knob := _touch_joystick.get_node_or_null("TouchJoystickKnob") as Control
+		if is_instance_valid(base):
+			base.position = Vector2.ZERO
+			base.size = Vector2.ONE * joystick_size
+		if is_instance_valid(knob):
+			var knob_size := Vector2.ONE * roundf(joystick_size * 0.48)
+			knob.size = knob_size
+			knob.position = (Vector2.ONE * joystick_size - knob_size) * 0.5
+	var skillbar_size := TOUCH_SKILLBAR_SIZE if touch_mode else Vector2(310, 86)
 	skillbar_size.x = minf(skillbar_size.x, safe.size.x - 24)
 	skillbar_size.y = roundf(skillbar_size.x * 86.0 / 310.0)
 	_place(
@@ -1759,6 +2114,13 @@ func _layout_runtime() -> void:
 		),
 		skillbar_size
 	)
+	if _component_nodes.has("mobile_context_actions"):
+		var context_actions := _component_nodes["mobile_context_actions"] as Control
+		_place(
+			"mobile_context_actions",
+			Vector2(safe.end.x - context_actions.size.x - 2.0, safe.end.y - context_actions.size.y - 6.0),
+			context_actions.size,
+		)
 	_layout_resident_prompt(safe)
 	_layout_feedback(safe)
 
@@ -1851,7 +2213,12 @@ func _layout_resident_prompt(safe: Rect2) -> void:
 		return
 	var prompt := _component_nodes["resident_prompt"] as Control
 	var anchor: Vector2 = prompt.get_meta("screen_anchor", Vector2(-1, -1))
-	var group_size := Vector2(minf(156.0, safe.size.x - 24.0), 60.0)
+	var touch_prompt := str(_fixture.get("inputMode", "keyboard_mouse")) == "touch"
+	var group_size := (
+		Vector2(minf(184.0, safe.size.x - 24.0), 76.0)
+		if touch_prompt
+		else Vector2(minf(156.0, safe.size.x - 24.0), 60.0)
+	)
 	var position := Vector2(
 		safe.position.x + (safe.size.x - group_size.x) * 0.5,
 		safe.position.y + safe.size.y * 0.38,
@@ -1872,8 +2239,8 @@ func _layout_resident_prompt(safe: Rect2) -> void:
 		safe.end.y - group_size.y - 12.0,
 	)
 	_place("resident_prompt", position, group_size)
-	_set_child_rect("resident_prompt_key", Rect2(17, 17, 35, 28))
-	_set_child_rect("resident_prompt_label", Rect2(58, 14, 82, 32))
+	_set_child_rect("resident_prompt_key", Rect2(17, 17, 0 if touch_prompt else 35, 28))
+	_set_child_rect("resident_prompt_label", Rect2(18 if touch_prompt else 58, 14, 148 if touch_prompt else 82, 48 if touch_prompt else 32))
 
 
 func _sync_live_resident_prompt_anchor() -> void:

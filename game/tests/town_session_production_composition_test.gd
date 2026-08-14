@@ -307,10 +307,8 @@ func _run() -> void:
 		_finish()
 		return
 	root.add_child(runtime)
-	await process_frame
-	await process_frame
-	await process_frame
-	await process_frame
+	for _frame_index in 64:
+		await process_frame
 	var startup := runtime.call("get_startup_result") as Dictionary
 	_expect_ok(startup, "configured production Town Runtime starts")
 	if not bool(startup.get("ok", false)):
@@ -1459,7 +1457,10 @@ func _verify_conversation_first_visible_frame(
 	).get("messages", []) as Array
 	_expect_equal(messages_after_draw.size(), 1, "the resident reply does not overtake the first rendered frame")
 	runtime.call("_pump_agent_gateway_for_frame")
-	for _frame_index: int in 6:
+	# World presentation deferral can legitimately consume several frames after
+	# the first draw. Keep the first-frame assertion above strict, then allow the
+	# budgeted queue to resume and prove that it eventually delivers the reply.
+	for _frame_index: int in 64:
 		await process_frame
 		var current := adapter.call("get_view_model", "conversation") as Dictionary
 		if ((current.get("data", {}) as Dictionary).get("messages", []) as Array).size() >= 2:
@@ -1527,7 +1528,7 @@ func _verify_conversation_first_visible_frame(
 		"the resident reply does not overtake the player's visible reply frame",
 	)
 	runtime.call("_pump_agent_gateway_for_frame")
-	for _frame_index: int in 6:
+	for _frame_index: int in 64:
 		await process_frame
 		var current := adapter.call("get_view_model", "conversation") as Dictionary
 		if (

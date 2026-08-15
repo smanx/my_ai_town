@@ -235,6 +235,9 @@ var _rebuild_after_joystick_release := false
 
 
 func _ready() -> void:
+	# This is a persistent interaction surface. World pages and the pause host
+	# may change independently, but they must not pause or remove the avatar HUD.
+	process_mode = Node.PROCESS_MODE_ALWAYS
 	set_anchors_and_offsets_preset(Control.PRESET_TOP_LEFT)
 	_fit_root_to_viewport()
 	get_viewport().size_changed.connect(_fit_root_to_viewport)
@@ -490,21 +493,10 @@ func apply_view_model(view_model: Dictionary) -> PackedStringArray:
 		!= _render_projection(scope, render_snapshot)
 	)
 	if is_node_ready() and not _binding_batch and render_changed:
-		if (
-			scope == "conversation"
-			and bool(
-				_render_projection(scope, render_snapshot).get(
-					"open",
-					false,
-				)
-			)
-		):
-			# The chat page covers this HUD. Hiding the existing tree is enough;
-			# rebuilding it just to retire every child delays the chat's first frame.
-			visible = false
-			mouse_filter = Control.MOUSE_FILTER_IGNORE
-		else:
-			_request_rebuild_preserving_joystick()
+		# Conversation and other routes do not own this layer. Rebuild only the
+		# HUD's own children from the latest snapshot while keeping its root and
+		# input surface mounted.
+		_request_rebuild_preserving_joystick()
 	return issues
 
 
@@ -576,7 +568,7 @@ func _apply_time_hud_view_model(view_model: Dictionary) -> PackedStringArray:
 	render_snapshot["data"] = render_data
 	_view_models[TIME_HUD_SCOPE] = render_snapshot
 	_revision_by_scope[TIME_HUD_SCOPE] = incoming_revision
-	if is_node_ready() and not _binding_batch and not _conversation_open():
+	if is_node_ready() and not _binding_batch:
 		_request_rebuild_preserving_joystick()
 	return PackedStringArray()
 
@@ -722,6 +714,7 @@ func get_runtime_snapshot() -> Dictionary:
 		"nearestResidentPromptOnly": true,
 		"targetSwitcherExposed": _component_nodes.has("target_switcher"),
 		"skillbarVisible": _component_nodes.has("skillbar"),
+		"conversationOpen": _conversation_open(),
 		"suppressedByConversation": _conversation_open(),
 		"focusedTargetId": str(data.get("focusedTargetId", "")),
 		"currentTargetId": str(current_target.get("targetId", "")),
@@ -920,6 +913,13 @@ func _rebuild() -> void:
 		visible = false
 		mouse_filter = Control.MOUSE_FILTER_IGNORE
 		return
+	if _conversation_open():
+		# The conversation page owns the visible interaction surface. Keep this
+		# HUD mounted on its independent CanvasLayer for fast restoration, but do
+		# not leave the skillbar, movement controls, or exit button above chat.
+		visible = false
+		mouse_filter = Control.MOUSE_FILTER_IGNORE
+		return
 	visible = true
 	var input_enabled := mode == "avatar_active"
 	mouse_filter = (
@@ -927,12 +927,8 @@ func _rebuild() -> void:
 		if input_enabled
 		else Control.MOUSE_FILTER_IGNORE
 	)
-	var conversation_open := _conversation_open()
-	if conversation_open:
-		# 玩家对话页是当前唯一 UI owner；化身 HUD 不在其背后重复显示。
-		visible = false
-		mouse_filter = Control.MOUSE_FILTER_IGNORE
-		return
+	# The resident conversation is an additional page. It must not unmount or
+	# suppress the avatar's movement and action controls.
 	_build_mode_panel(data)
 	if not input_enabled:
 		_movement_hint_dismissed = false
@@ -1413,6 +1409,7 @@ func _build_skillbar(data: Dictionary, avatar: Dictionary) -> void:
 			14,
 		)
 		skill_art.size = SKILL_ART_SIZE
+		_set_skillbar_logical_rect(skill_art)
 		root.add_child(skill_art)
 		_add_intent_button(root, action, action_id, action_payload)
 		var button := _action_nodes.get(action_id) as Button
@@ -1423,6 +1420,7 @@ func _build_skillbar(data: Dictionary, avatar: Dictionary) -> void:
 				9,
 			)
 			button.size = SKILL_BUTTON_SIZE
+			_set_skillbar_logical_rect(button)
 			button.tooltip_text = (
 				"%s · %s" % [skill.get("key", ""), skill.get("label", "")]
 				if bool(action.get("enabled", false))
@@ -1456,8 +1454,40 @@ func _build_skillbar(data: Dictionary, avatar: Dictionary) -> void:
 		key.add_theme_constant_override("outline_size", 3)
 		key.position = Vector2(slot_center_x + 15, 56)
 		key.size = SKILL_KEY_SIZE
+		_set_skillbar_logical_rect(key)
 		key.visible = not touch_mode
 		root.add_child(key)
+
+
+func _set_skillbar_logical_rect(control: Control) -> void:
+	control.set_meta("skillbarLogicalPosition", control.position)
+	control.set_meta("skillbarLogicalSize", control.size)
+
+
+func _layout_skillbar_children(skillbar_size: Vector2) -> void:
+	var skillbar := _component_nodes.get("skillbar") as Control
+	if skillbar == null:
+		return
+	var scale_value := Vector2(
+		skillbar_size.x / SKILLBAR_LOGICAL_SIZE.x,
+		skillbar_size.y / SKILLBAR_LOGICAL_SIZE.y,
+	)
+	for child: Node in skillbar.get_children():
+		if not child is Control:
+			continue
+		var control := child as Control
+		var logical_position: Variant = control.get_meta(
+			"skillbarLogicalPosition",
+			control.position,
+		)
+		var logical_size: Variant = control.get_meta(
+			"skillbarLogicalSize",
+			control.size,
+		)
+		if logical_position is Vector2:
+			control.position = (logical_position as Vector2) * scale_value
+		if logical_size is Vector2:
+			control.size = (logical_size as Vector2) * scale_value
 
 
 func _build_mobile_context_actions(data: Dictionary, avatar: Dictionary) -> void:
@@ -1528,6 +1558,7 @@ func _skillbar_child_rects() -> Array[Dictionary]:
 	var skillbar := _component_nodes.get("skillbar") as Control
 	if skillbar == null:
 		return result
+	var shell_rect := Rect2(Vector2.ZERO, skillbar.size)
 	for child: Node in skillbar.get_children():
 		if not child is Control:
 			continue
@@ -1540,9 +1571,7 @@ func _skillbar_child_rects() -> Array[Dictionary]:
 				control.size.x,
 				control.size.y,
 			],
-			"insideShell": Rect2(Vector2.ZERO, SKILLBAR_LOGICAL_SIZE).encloses(
-				Rect2(control.position, control.size)
-			),
+			"insideShell": shell_rect.encloses(Rect2(control.position, control.size)),
 		})
 	return result
 
@@ -2114,6 +2143,7 @@ func _layout_runtime() -> void:
 		),
 		skillbar_size
 	)
+	_layout_skillbar_children(skillbar_size)
 	if _component_nodes.has("mobile_context_actions"):
 		var context_actions := _component_nodes["mobile_context_actions"] as Control
 		_place(
@@ -2687,12 +2717,18 @@ func _activate_focused_button() -> bool:
 func _can_accept_interaction_input() -> bool:
 	if not _configured or not visible or mouse_filter == Control.MOUSE_FILTER_IGNORE:
 		return false
+	if _conversation_open():
+		return false
+	var focus_owner := get_viewport().gui_get_focus_owner()
+	if focus_owner is LineEdit or focus_owner is TextEdit:
+		# Text fields on chat and settings pages must keep keyboard shortcuts
+		# (F/1-4/E/R) as text input.
+		return false
 	var avatar: Dictionary = _view_models.get("avatar", {})
 	var data: Dictionary = avatar.get("data", {})
 	return (
 		str(data.get("mode", "")) == "avatar_active"
 		and str(avatar.get("status", "")) != "disabled"
-		and not _conversation_open()
 	)
 
 

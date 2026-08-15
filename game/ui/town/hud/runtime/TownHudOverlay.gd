@@ -79,6 +79,7 @@ const MOBILE_CONTROL_SOURCE_RECTS := {
 	"time_speed_3": Rect2(1568, 621, 68, 68),
 	"avatar_toggle": Rect2(775, 831, 126, 96),
 }
+const MOBILE_LEFT_TOUCH_PADDING := 10.0
 const MOBILE_LEFT_CONTROL_IDS := [
 	"nav_residents",
 	"nav_places",
@@ -123,6 +124,7 @@ var _current_revision := -1
 var _view_model: Dictionary = {}
 var _data: Dictionary = {}
 var _actions: Dictionary = {}
+var _render_signature: Dictionary = {}
 var _layout: Dictionary = {}
 var _labels: Dictionary = {}
 var _buttons: Dictionary = {}
@@ -225,10 +227,24 @@ func apply_view_model(view_model: Dictionary) -> bool:
 		return false
 	_last_rejection = PackedStringArray()
 	_current_revision = incoming_revision
-	_view_model = view_model.duplicate(true)
-	_data = UiViewModel.data_for_render(_view_model, _data)
-	_actions = (_view_model.get("actions", {}) as Dictionary).duplicate(true)
-	_render()
+	var previous_data := _data
+	var previous_render_signature := _render_signature
+	# Town time advances once per real second. The incoming HUD projection is
+	# immutable from this consumer, so keep only a shallow shell here; the old
+	# deep copy duplicated every resident directory, bubble and action payload
+	# before each clock tick could be shown.
+	_view_model = view_model.duplicate(false)
+	_data = _data_for_render_shallow(view_model, _data)
+	_actions = (_view_model.get("actions", {}) as Dictionary).duplicate(false)
+	_render_signature = _hud_render_signature(_data, _actions)
+	var time_changed: bool = (
+		previous_data.get("timeWeather", {})
+		!= _data.get("timeWeather", {})
+	)
+	if previous_data.is_empty() or previous_render_signature != _render_signature:
+		_render()
+	elif time_changed:
+		_render_time_weather()
 	if is_instance_valid(_far_resident_activity_layer):
 		_far_resident_activity_layer.apply_view_model(_view_model)
 	view_model_applied.emit(
@@ -242,6 +258,123 @@ func apply_view_model(view_model: Dictionary) -> bool:
 			Time.get_ticks_usec() - probe_started_usec,
 		)
 	return true
+
+
+func _data_for_render_shallow(
+	view_model: Dictionary,
+	last_confirmed_data: Dictionary,
+) -> Dictionary:
+	var incoming := view_model.get("data", {}) as Dictionary
+	if (
+		UiViewModel.operation_status(view_model) == &"rejected"
+		and incoming.is_empty()
+	):
+		return last_confirmed_data.duplicate(false)
+	return incoming.duplicate(false)
+
+
+func _hud_render_signature(data: Dictionary, actions: Dictionary) -> Dictionary:
+	# Do not compare resident bubbles, anchors or directory payloads recursively
+	# on every game-minute tick. The far layer owns the transient overlays; the
+	# persistent HUD only needs these small semantic fields to know when a full
+	# control/layout render is required.
+	return {
+		"toolbar": _hud_items_signature(
+			data.get("toolbar", {}) as Dictionary,
+			["id", "toolId", "actionKey", "label", "badge", "enabled", "disabledReason"],
+		),
+		"camera": _hud_scalar_section_signature(
+			data.get("camera", {}) as Dictionary,
+			["mode", "focusedResidentId", "focusedResidentName", "zoomStep", "zoomRatio", "zoomStepCount", "canDrag", "canReset", "followTargetId"],
+		),
+		"pausePrompt": _hud_scalar_section_signature(
+			data.get("pausePrompt", {}) as Dictionary,
+			["visible", "reasonCodes", "label"],
+		),
+		"residentDirectory": _hud_items_signature(
+			data.get("residentDirectory", {}) as Dictionary,
+			["residentId", "residentName", "behaviorLabel", "behaviorShortLabel", "locationLabel", "portraitStatus", "portraitTexture", "portraitFallbackText", "selected"],
+		),
+		"placeDirectory": _hud_items_signature(
+			data.get("placeDirectory", {}) as Dictionary,
+			["placeName", "placeType", "residentCount", "selected"],
+		),
+		"mapInteraction": _hud_scalar_section_signature(
+			data.get("mapInteraction", {}) as Dictionary,
+			["mode", "spaceId", "hoverTargetId", "selectedTargetId", "promptCode", "promptLabel"],
+		),
+		"indoorMarkers": _hud_items_signature(
+			data.get("indoorMarkers", {}) as Dictionary,
+			["buildingId", "residentCount", "residentId", "residentName", "spaceId", "label"],
+		),
+		"eventOverlay": _hud_items_signature(
+			data.get("eventOverlay", {}) as Dictionary,
+			["eventId", "title", "label", "visible", "threadId"],
+		),
+		"density": _hud_scalar_section_signature(
+			data.get("density", {}) as Dictionary,
+			["zoomBand", "hysteresisActive", "suppressedCount"],
+		),
+		"actions": _hud_actions_signature(actions),
+	}
+
+
+func _hud_scalar_section_signature(
+	section: Dictionary,
+	keys: Array[String],
+) -> Array:
+	var result: Array = []
+	for key in keys:
+		var value: Variant = section.get(key)
+		if value is Array:
+			result.append([key, (value as Array).duplicate()])
+		else:
+			result.append([key, value])
+	return result
+
+
+func _hud_items_signature(section: Dictionary, item_keys: Array[String]) -> Array:
+	var result: Array = [
+		bool(section.get("available", true)),
+		bool(section.get("visible", false)),
+		String(section.get("selectedResidentId", "")),
+		String(section.get("selectedPlaceName", "")),
+		String(section.get("buildingId", "")),
+		int(section.get("totalCount", section.get("residentCount", 0))),
+		int(section.get("residentCount", 0)),
+		int(section.get("visibleBudget", 0)),
+	]
+	for value: Variant in section.get("items", []) as Array:
+		if not value is Dictionary:
+			continue
+		var item := value as Dictionary
+		var item_signature: Array = []
+		for key in item_keys:
+			var item_value: Variant = item.get(key)
+			if item_value is Array:
+				item_signature.append([key, (item_value as Array).duplicate()])
+			else:
+				item_signature.append([key, item_value])
+		result.append(item_signature)
+	return result
+
+
+func _hud_actions_signature(actions: Dictionary) -> Array:
+	var keys: Array[String] = []
+	for key_value: Variant in actions.keys():
+		keys.append(String(key_value))
+	keys.sort()
+	var result: Array = []
+	for key in keys:
+		var action := actions.get(key, {}) as Dictionary
+		result.append([
+			key,
+			bool(action.get("enabled", false)),
+			String(action.get("intent", "")),
+			String(action.get("disabledReason", "")),
+			(action.get("payload", {}) as Dictionary).duplicate(false),
+		])
+	return result
 
 
 func current_revision() -> int:
@@ -773,7 +906,7 @@ func _apply_layout() -> void:
 func _apply_resident_directory_layout() -> void:
 	if not is_instance_valid(_resident_directory):
 		return
-	var safe := _layout.get("safeRect", Rect2(Vector2.ZERO, size)) as Rect2
+	var safe := _drawer_safe_rect()
 	var nav_rect := _layout_target_rect("nav_residents")
 	var breakpoint_id := StringName(_layout.get("breakpoint", &""))
 	var drawer_height: float
@@ -812,7 +945,7 @@ func _apply_resident_directory_layout() -> void:
 func _apply_place_directory_layout() -> void:
 	if not is_instance_valid(_place_directory):
 		return
-	var safe := _layout.get("safeRect", Rect2(Vector2.ZERO, size)) as Rect2
+	var safe := _drawer_safe_rect()
 	var nav_rect := _layout_target_rect("nav_places")
 	var breakpoint_id := StringName(_layout.get("breakpoint", &""))
 	var drawer_height: float
@@ -848,6 +981,14 @@ func _apply_place_directory_layout() -> void:
 	_place_directory.size = Vector2(drawer_width, drawer_height).round()
 
 
+func _drawer_safe_rect() -> Rect2:
+	# The painted mobile HUD intentionally uses the physical viewport origin,
+	# while semantic drawers must stay inside the actual display safe area.
+	if MOBILE_UI_PROFILE.is_mobile_runtime():
+		return MOBILE_UI_PROFILE.safe_rect(size, safe_insets)
+	return _layout.get("safeRect", Rect2(Vector2.ZERO, size)) as Rect2
+
+
 func _apply_runtime_skin_layout() -> void:
 	if not is_instance_valid(_skin_root):
 		return
@@ -860,7 +1001,10 @@ func _apply_runtime_skin_layout() -> void:
 		# Assemble the phone HUD from independent source regions. Only the empty
 		# top and bottom frame bands stretch; rails, time/weather and avatar art
 		# retain uniform scale.
-		var safe := _layout.get("safeRect", Rect2(Vector2.ZERO, size)) as Rect2
+		# Rails and their hit targets share the physical viewport origin. Safe
+		# insets are reserved for drawers and semantic overlays; applying them to
+		# the painted rail moves the artwork away from the edge on cutout devices.
+		var safe := Rect2(Vector2.ZERO, size)
 		var mobile_scale := safe.size.y / HUD_REFERENCE_SIZE.y
 		outer.visible = false
 		_layout_mobile_hud_piece(
@@ -943,40 +1087,50 @@ func _mobile_hud_control_rect(id: String, fallback: Rect2) -> Rect2:
 		anchor = &"right"
 	elif id == "avatar_toggle":
 		anchor = &"center_bottom"
-	return _mobile_hud_reference_rect(
+	var rect := _mobile_hud_reference_rect(
 		MOBILE_CONTROL_SOURCE_RECTS[id] as Rect2,
 		anchor,
 	)
+	if id in MOBILE_LEFT_CONTROL_IDS:
+		# 左侧导轨的画面资产保持原尺寸，触控命中框向导轨内外扩展。
+		# 这样不会拉伸图标，也不会要求玩家精确点在小图标像素上。
+		var padding := MOBILE_LEFT_TOUCH_PADDING * size.y / HUD_REFERENCE_SIZE.y
+		rect.position.x = maxf(0.0, rect.position.x - padding)
+		rect.size.x = minf(
+			MOBILE_LEFT_RAIL_RECT.size.x * size.y / HUD_REFERENCE_SIZE.y,
+			rect.size.x + padding,
+		)
+		rect.position.y = maxf(0.0, rect.position.y - padding)
+		rect.size.y = rect.size.y + padding * 2.0
+	return rect
 
 
 func _mobile_hud_reference_rect(
 	source_rect: Rect2,
 	anchor: StringName,
 ) -> Rect2:
-	var safe := MOBILE_UI_PROFILE.safe_rect(size, safe_insets)
-	var mobile_scale := safe.size.y / HUD_REFERENCE_SIZE.y
+	# The painted mobile HUD is already laid out against the full viewport. Safe
+	# insets are used by drawers and semantic overlays, but applying them here a
+	# second time shifts the actual button hit targets away from the artwork.
+	var mobile_scale := size.y / HUD_REFERENCE_SIZE.y
 	var display_size := source_rect.size * mobile_scale
-	var display_position := safe.position + source_rect.position * mobile_scale
+	var display_position := source_rect.position * mobile_scale
 	match anchor:
 		&"right":
-			display_position.x = safe.end.x - (
+			display_position.x = size.x - (
 				HUD_REFERENCE_SIZE.x - source_rect.end.x
 			) * mobile_scale - display_size.x
 		&"center":
 			var center_offset := (
 				source_rect.get_center().x - HUD_REFERENCE_SIZE.x * 0.5
 			) * mobile_scale
-			display_position.x = (
-				safe.get_center().x + center_offset - display_size.x * 0.5
-			)
+			display_position.x = size.x * 0.5 + center_offset - display_size.x * 0.5
 		&"center_bottom":
 			var center_offset := (
 				source_rect.get_center().x - HUD_REFERENCE_SIZE.x * 0.5
 			) * mobile_scale
-			display_position.x = (
-				safe.get_center().x + center_offset - display_size.x * 0.5
-			)
-			display_position.y = safe.end.y - (
+			display_position.x = size.x * 0.5 + center_offset - display_size.x * 0.5
+			display_position.y = size.y - (
 				HUD_REFERENCE_SIZE.y - source_rect.end.y
 			) * mobile_scale - display_size.y
 		_:
@@ -1054,6 +1208,24 @@ func _density_band() -> String:
 func _render() -> void:
 	if _data.is_empty():
 		return
+	_render_time_weather()
+	if is_instance_valid(_resident_directory):
+		_resident_directory.apply_directory(
+			_data.get("residentDirectory", {}) as Dictionary
+		)
+	if is_instance_valid(_place_directory):
+		_place_directory.apply_directory(
+			_data.get("placeDirectory", {}) as Dictionary
+		)
+	_apply_runtime_skin_layout()
+	_update_visibility()
+	_configure_actions()
+	_update_runtime_skin_visibility()
+
+
+func _render_time_weather() -> void:
+	if _data.is_empty():
+		return
 	var time_weather := _data.get("timeWeather", {}) as Dictionary
 	var day := int(time_weather.get("day", 0))
 	var clock := String(time_weather.get("clock", ""))
@@ -1073,18 +1245,10 @@ func _render() -> void:
 		"time_weather",
 		" ".join(status_parts) if not status_parts.is_empty() else "时间未就绪"
 	)
-	if is_instance_valid(_resident_directory):
-		_resident_directory.apply_directory(
-			_data.get("residentDirectory", {}) as Dictionary
-		)
-	if is_instance_valid(_place_directory):
-		_place_directory.apply_directory(
-			_data.get("placeDirectory", {}) as Dictionary
-		)
-	_apply_runtime_skin_layout()
-	_update_visibility()
-	_configure_actions()
-	_update_runtime_skin_visibility()
+	_configure_time_speed_buttons()
+	_update_time_control_pressed_state(
+		bool((_data.get("pausePrompt", {}) as Dictionary).get("visible", false))
+	)
 
 
 func _configure_actions() -> void:
@@ -1136,8 +1300,15 @@ func _update_time_control_pressed_state(paused: bool) -> void:
 	):
 		next_id = ""
 	var changed := next_id != _selected_time_control_id
-	_selected_time_control_id = next_id
 	var visual_rect := _time_control_panel_visual_rect()
+	var same_rect := (
+		is_instance_valid(_time_control_panel_face)
+		and _time_control_panel_face.position == visual_rect.position
+		and _time_control_panel_face.size == visual_rect.size
+	)
+	if not changed and same_rect:
+		return
+	_selected_time_control_id = next_id
 	_time_control_panel_face.texture = _time_control_panel_texture(next_id)
 	_time_control_panel_face.position = visual_rect.position
 	_time_control_panel_face.size = visual_rect.size

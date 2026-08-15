@@ -1318,6 +1318,9 @@ const HOST_SCRIPT := preload(
 const AVATAR_HUD_SCENE := preload(
 	"res://ui/avatar_mode/runtime/AvatarModeHud.tscn"
 )
+const RESIDENT_DIRECTORY_DRAWER := preload(
+	"res://ui/town/hud/runtime/ResidentDirectoryDrawer.gd"
+)
 const SYSTEM_FEEDBACK_TOAST_SCENE := preload(
 	"res://ui/common/system_feedback/SystemFeedbackToast.tscn"
 )
@@ -1581,19 +1584,37 @@ func _scenario_avatar_perception_only_refreshes_avatar_scope() -> void:
 	adapter.call("_on_player_avatar_perception_changed", {
 		"source": "avatar_position",
 		"semanticStateChanged": false,
+		"nearbyChanged": false,
+		"positionChanged": true,
 	})
 	_expect(
 		(adapter.get("_pending_world_refresh_scopes") as Array).is_empty(),
 		"化身纯位置感知变化不会排队整套小镇 UI",
 	)
 	_expect(
+		((adapter.get("_view_models") as Dictionary).get("avatar", {}) as Dictionary).is_empty(),
+		"化身纯位置感知变化不生成任何化身界面快照",
+	)
+	_expect(
+		(adapter.get("_pending_world_refresh_scopes") as Array).is_empty(),
+		"化身纯位置变化不留下 UI 修订抑制或待刷新队列",
+	)
+	adapter.call("_on_player_avatar_perception_changed", {
+		"source": "avatar_position",
+		"semanticStateChanged": false,
+		"nearbyChanged": true,
+		"positionChanged": true,
+		"added": ["林岚"],
+		"removed": [],
+	})
+	_expect(
 		not ((adapter.get("_view_models") as Dictionary).get("avatar", {}) as Dictionary).is_empty(),
-		"化身纯位置感知变化仍立即生成化身目标界面",
+		"附近居民集合变化时仍立即生成化身目标界面",
 	)
 	adapter.call("_on_world_revision_changed", 2)
 	_expect(
 		(adapter.get("_pending_world_refresh_scopes") as Array).is_empty(),
-		"化身纯位置修订不会在世界修订信号中重新排队 town_hud",
+		"附近居民位置修订不会在世界修订信号中重新排队 town_hud",
 	)
 	adapter.free()
 
@@ -1646,6 +1667,7 @@ func _scenario_mobile_platform_foundation() -> void:
 		"铺满背景统一等比缩放",
 	)
 	await _verify_mobile_touch_scroll_router()
+	await _verify_resident_directory_source_scaling()
 	await _verify_mobile_text_input_policy()
 	await _verify_mobile_scene_interaction()
 	_verify_mobile_page_layout_assets()
@@ -1671,6 +1693,90 @@ func _scenario_mobile_platform_foundation() -> void:
 			game_flow_host.get_node_or_null("MobileTextInputPolicy") == null,
 			"桌面运行时不能接管文本输入",
 		)
+
+
+func _verify_resident_directory_source_scaling() -> void:
+	var drawer := RESIDENT_DIRECTORY_DRAWER.new() as Control
+	drawer.size = Vector2(720.0, 1080.0)
+	root.add_child(drawer)
+	await process_frame
+	var buttons := drawer.get("_row_buttons") as Array
+	var content := (
+		(buttons[0] as Button).get_meta("content") as Control
+		if not buttons.is_empty()
+		else null
+	)
+	_expect(content != null, "居民目录行内容节点存在")
+	if content != null:
+		_expect_equal(
+			content.size,
+			Vector2(604.0, 146.0),
+			"居民目录行内容保持原始排版尺寸",
+		)
+		_expect_equal(
+			content.scale,
+			Vector2(720.0 / 1024.0, 1080.0 / 1536.0),
+			"居民目录头像与文字在平板比例下统一缩放",
+		)
+	drawer.queue_free()
+	await process_frame
+
+
+func _verify_avatar_skillbar_touch_scaling() -> void:
+	var original_size := _avatar_hud.size
+	var original_fixture := (_avatar_hud.get("_fixture") as Dictionary).duplicate(true)
+	_avatar_hud.set("_fixture", {
+		"inputMode": "touch",
+		"safeInsets": {"top": 0, "right": 0, "bottom": 0, "left": 0},
+		"copyScale": 1.0,
+	})
+	_avatar_hud.size = Vector2(1280.0, 720.0)
+	_avatar_hud.call("_request_rebuild_preserving_joystick")
+	await process_frame
+	await process_frame
+	var snapshot := _avatar_hud.call("get_runtime_snapshot") as Dictionary
+	var skillbar_rect := _component_rect(
+		snapshot.get("componentRects", []) as Array,
+		"skillbar",
+	)
+	_expect_equal(
+		skillbar_rect.size,
+		Vector2(496.0, 138.0),
+		"触控技能栏外框使用手机版放大尺寸",
+	)
+	var child_rects := snapshot.get("skillbarChildRects", []) as Array
+	var art_size := Vector2.ZERO
+	var button_size := Vector2.ZERO
+	var all_children_inside := true
+	for child_value: Variant in child_rects:
+		if not child_value is Dictionary:
+			continue
+		var child := child_value as Dictionary
+		var values := child.get("rect", []) as Array
+		if values.size() != 4:
+			continue
+		var child_size := Vector2(float(values[2]), float(values[3]))
+		match String(child.get("name", "")):
+			"SkillAttack1Art":
+				art_size = child_size
+			"SkillAttack1Button":
+				button_size = child_size
+		all_children_inside = all_children_inside and bool(child.get("insideShell", false))
+	_expect(
+		is_equal_approx(art_size.x, 58.0 * 496.0 / 310.0)
+			and is_equal_approx(art_size.y, 58.0 * 138.0 / 86.0),
+		"触控技能图标随技能栏外框同步放大",
+	)
+	_expect(
+		is_equal_approx(button_size.x, 68.0 * 496.0 / 310.0)
+			and is_equal_approx(button_size.y, 68.0 * 138.0 / 86.0),
+		"触控技能点击区域随技能栏外框同步放大",
+	)
+	_expect(all_children_inside, "放大后的技能图标与点击区域仍位于技能栏框内")
+	_avatar_hud.set("_fixture", original_fixture)
+	_avatar_hud.size = original_size
+	_avatar_hud.call("_request_rebuild_preserving_joystick")
+	await process_frame
 
 
 func _verify_mobile_touch_scroll_router() -> void:
@@ -2216,6 +2322,73 @@ func _scenario_ui_runtime_host_navigation() -> void:
 		"active avatar mode enables AvatarModeHud input",
 	)
 	var active_snapshot := _avatar_hud.call("get_runtime_snapshot") as Dictionary
+	await _verify_avatar_skillbar_touch_scaling()
+	# The conversation page owns the visible interaction surface. Keep the
+	# AvatarModeHud mounted for fast restoration, but hide its skillbar and
+	# movement controls so the chat close button and input remain clickable.
+	_adapter.publish("conversation", {
+		"source": "runtime",
+		"capabilityMode": "formal",
+		"formalReady": true,
+		"displayMode": "player",
+		"conversationId": "avatar-conversation-while-active",
+		"residentId": "resident-lin",
+		"residentName": "林岚",
+		"messages": [],
+		"canAttachPhoto": false,
+	})
+	await process_frame
+	await process_frame
+	_expect_equal(
+		_host.call("current_route"),
+		&"chat",
+		"active avatar can open the real conversation page",
+	)
+	_expect(not _avatar_hud.visible, "conversation page hides the active AvatarModeHud")
+	_expect_equal(
+		_avatar_hud.process_mode,
+		Node.PROCESS_MODE_ALWAYS,
+		"active AvatarModeHud keeps processing while conversation waits",
+	)
+	var conversation_active_snapshot := _avatar_hud.call("get_runtime_snapshot") as Dictionary
+	_expect(
+		bool(conversation_active_snapshot.get("suppressedByConversation", false)),
+		"conversation projection suppresses the avatar surface",
+	)
+	_expect(
+		not bool(conversation_active_snapshot.get("skillbarVisible", true)),
+		"conversation page hides the attack skillbar",
+	)
+	var conversation_editor := TextEdit.new()
+	conversation_editor.name = "ConversationShortcutInputProbe"
+	root.add_child(conversation_editor)
+	conversation_editor.grab_focus()
+	await process_frame
+	_expect(
+		not bool(_avatar_hud.call("_can_accept_interaction_input")),
+		"conversation text focus blocks avatar keyboard shortcuts while HUD is hidden",
+	)
+	conversation_editor.release_focus()
+	conversation_editor.queue_free()
+	await process_frame
+	_adapter.publish("conversation", {
+		"source": "runtime",
+		"capabilityMode": "formal",
+		"formalReady": true,
+		"displayMode": "player",
+		"conversationId": "",
+		"residentId": "resident-lin",
+		"residentName": "林岚",
+		"messages": [],
+		"canAttachPhoto": false,
+	})
+	await process_frame
+	_expect_equal(
+		_host.call("current_route"),
+		&"town",
+		"closing conversation returns to the same active avatar route",
+	)
+	_expect(_avatar_hud.visible, "closing conversation keeps the active AvatarModeHud mounted")
 	# 化身模式已收敛为底部技能槽,不再显示常驻 WASD 移动指引。
 	_expect(
 		not bool(active_snapshot.get("wasdVisible", true)),

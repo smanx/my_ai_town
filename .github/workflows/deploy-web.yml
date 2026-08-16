@@ -349,6 +349,29 @@ jobs:
               print("patched StartupScreen.gd with host-failure diagnostics (TEMP)")
           else:
               print("StartupScreen diagnostics already present, skipping")
+          # ---- 7) REAL FIX: Web 上 OS.get_process_id()==0 导致 claim 校验失败 ----
+          pid_helpers = '''
+          # --- Web process-id fallback (injected by deploy-web.yml; repo game/ untouched) ---
+          func _canonical_process_id_text(value: String) -> bool:
+          \t# Web 平台没有进程概念，OS.get_process_id() 恒为 0。
+          \tif value == "0":
+          \t\treturn true
+          \treturn _canonical_positive_integer_text(value)
+          '''
+          st4 = store_path.read_text(encoding="utf-8")
+          if "func _canonical_process_id_text" not in st4:
+              a7 = "\t\tand _canonical_positive_integer_text(owner_pid_value as String)"
+              b7 = "\t\tand _canonical_process_id_text(owner_pid_value as String)"
+              assert st4.count(a7) == 1, "pid validation anchor changed"
+              st4 = st4.replace(a7, b7)
+              if not st4.endswith("\n"):
+                  st4 += "\n"
+              st4 += pid_helpers
+              store_path.write_text(st4, encoding="utf-8")
+              print("patched TownSessionSaveStore.gd PID validation (REAL FIX)")
+          else:
+              print("PID validation fix already present, skipping")
+
           PY
 
       - name: Import project (web build)

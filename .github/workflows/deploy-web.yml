@@ -107,6 +107,77 @@ jobs:
           path: ${{ runner.temp }}/game-build
           key: web-build-v2-${{ env.GODOT_VERSION }}-${{ hashFiles('game/**') }}
 
+      - name: Patch Web device-id fallback (game/ untouched)
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/game-build"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("world/presentation/ui/TownProviderCredentialStore.gd")
+          text = path.read_text(encoding="utf-8")
+
+          # Anchor: the only OS.get_unique_id() call site in the project.
+          old_line = "\tvar device_id := OS.get_unique_id().strip_edges()"
+          new_line = "\tvar device_id := _device_id()"
+          assert text.count(old_line) == 1, (
+              "expected exactly one OS.get_unique_id() call site; source may have changed"
+          )
+          text = text.replace(old_line, new_line)
+
+          # Web 上 OS.get_unique_id() 被引擎硬桩并打印 ERROR，不能调用。
+          # 改为：随机生成设备 ID 持久化到 user://device_id（Web 即 IndexedDB），
+          # 非 Web 平台仍走 OS.get_unique_id()，桌面行为不变。
+          helpers = '''
+          # --- Web device-id fallback (injected by deploy-web.yml; repo game/ untouched) ---
+          const WEB_DEVICE_ID_PATH := "user://device_id"
+          const DEVICE_ID_BYTE_COUNT := 32
+
+          func _device_id() -> String:
+          \tif OS.has_feature("web"):
+          \t\treturn _web_device_id()
+          \treturn OS.get_unique_id().strip_edges()
+
+          func _web_device_id() -> String:
+          \tvar stored := _load_stored_device_id()
+          \tif not stored.is_empty():
+          \t\treturn stored
+          \tvar generated := _generate_device_id()
+          \tif _persist_device_id(generated):
+          \t\treturn generated
+          \treturn generated
+
+          func _generate_device_id() -> String:
+          \treturn Crypto.new().generate_random_bytes(DEVICE_ID_BYTE_COUNT).hex_encode()
+
+          func _load_stored_device_id(path := WEB_DEVICE_ID_PATH) -> String:
+          \tif not FileAccess.file_exists(path):
+          \t\treturn ""
+          \tvar file := FileAccess.open(path, FileAccess.READ)
+          \tif file == null:
+          \t\treturn ""
+          \tvar stored := (file.get_as_text() as String).strip_edges()
+          \tif stored.length() != DEVICE_ID_BYTE_COUNT * 2 or not stored.is_valid_hex_number(false):
+          \t\treturn ""
+          \treturn stored
+
+          func _persist_device_id(device_id: String, path := WEB_DEVICE_ID_PATH) -> bool:
+          \tvar file := FileAccess.open(path, FileAccess.WRITE)
+          \tif file == null:
+          \t\treturn false
+          \tfile.store_string(device_id)
+          \tfile.flush()
+          \tvar error := file.get_error()
+          \tfile = null
+          \treturn error == OK
+          '''
+          if not text.endswith("\n"):
+              text += "\n"
+          text += helpers
+          path.write_text(text, encoding="utf-8")
+          print("patched TownProviderCredentialStore.gd with Web device-id fallback")
+          PY
+
       - name: Import project (web build)
         if: steps.web-build-cache.outputs.cache-hit != 'true'
         run: godot --headless --path "$RUNNER_TEMP/game-build" --import

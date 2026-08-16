@@ -218,6 +218,21 @@ jobs:
           else:
               print("PID validation fix already present, skipping")
 
+          # ---- 3) PWA: enable progressive web app in the Web export preset ----
+          preset = Path("export_presets.cfg")
+          cfg_text = preset.read_text(encoding="utf-8")
+          # 只在构建副本里打开 PWA，仓库里的 export_presets.cfg 保持原样。
+          # 幂等：缓存命中时配置已是 true，replace 为空操作。
+          cfg_after = cfg_text.replace(
+              "progressive_web_app/enabled=false",
+              "progressive_web_app/enabled=true",
+          )
+          if cfg_after != cfg_text:
+              preset.write_text(cfg_after, encoding="utf-8")
+              print("patched export_presets.cfg: progressive_web_app/enabled=true")
+          else:
+              print("PWA already enabled in export_presets.cfg, skipping")
+
           PY
 
       - name: Import project (web build)

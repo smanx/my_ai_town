@@ -118,12 +118,6 @@ jobs:
           marker = "# --- Web device-id fallback (injected by deploy-web.yml; repo game/ untouched) ---"
           old_line = "\tvar device_id := OS.get_unique_id().strip_edges()"
 
-          text = target.read_text(encoding="utf-8")
-          if marker in text:
-              # 缓存恢复的构建副本可能已包含注入代码；幂等跳过。
-              print("already patched, skipping")
-              raise SystemExit(0)
-
           # 除注入点外，项目里任何 Web 不安全 OS 调用都会在 Web 上重新报错。
           # tests/ 不会随部署运行，排除；隐藏目录（.godot 等）跳过。
           web_unsafe = ["OS.get_unique_id()", "OS.kill(", "execute_with_pipe"]
@@ -136,11 +130,6 @@ jobs:
               and any(u in p.read_text(encoding="utf-8", errors="ignore") for u in web_unsafe)
           ]
           assert not strays, "web-unsafe OS calls found: " + ", ".join(strays)
-
-          assert text.count(old_line) == 1, (
-              "expected exactly one OS.get_unique_id() call site; source may have changed"
-          )
-          text = text.replace(old_line, "\tvar device_id := _device_id()")
 
           # Web 上 OS.get_unique_id() 被引擎硬桩并打印 ERROR，不能调用。
           # 改为：随机生成设备 ID 持久化到 user://device_id（Web 即 IndexedDB），
@@ -188,11 +177,75 @@ jobs:
           \tfile = null
           \treturn error == OK
           '''
-          if not text.endswith("\n"):
-              text += "\n"
-          text += helpers
-          target.write_text(text, encoding="utf-8")
-          print("patched TownProviderCredentialStore.gd with Web device-id fallback")
+
+          # ---- 1) Credential store: Web-safe device id (real fix) ----
+          text = target.read_text(encoding="utf-8")
+          if marker not in text:
+              # 缓存恢复的构建副本可能已包含注入代码；幂等跳过。
+              assert text.count(old_line) == 1, (
+                  "expected exactly one OS.get_unique_id() call site; source may have changed"
+              )
+              text = text.replace(old_line, "\tvar device_id := _device_id()")
+              if not text.endswith("\n"):
+                  text += "\n"
+              text += helpers
+              target.write_text(text, encoding="utf-8")
+              print("patched TownProviderCredentialStore.gd with Web device-id fallback")
+          else:
+              print("credential store already patched, skipping")
+
+          # ---- 2) TEMP diagnostics: print catalog/host failures to console ----
+          gf_path = Path("world/presentation/game_flow/GameFlowHost.gd")
+          gf = gf_path.read_text(encoding="utf-8")
+          if "DIAG catalog snapshot fail" not in gf:
+              a1 = "\n".join([
+                  "func _startup_catalog_snapshot() -> Dictionary:",
+                  "\tvar interrupted_recovery := _recover_interrupted_formal_overwrites()",
+                  "\tif not bool(interrupted_recovery.get(\"ok\", false)):",
+                  "\t\treturn interrupted_recovery",
+              ])
+              b1 = "\n".join([
+                  "func _startup_catalog_snapshot() -> Dictionary:",
+                  "\tvar interrupted_recovery := _recover_interrupted_formal_overwrites()",
+                  "\tif not bool(interrupted_recovery.get(\"ok\", false)):",
+                  '\t\tprinterr("DIAG catalog recovery fail: ", JSON.stringify(interrupted_recovery))',
+                  "\t\treturn interrupted_recovery",
+              ])
+              assert gf.count(a1) == 1, "startup_catalog_snapshot anchor changed"
+              gf = gf.replace(a1, b1)
+              a2 = "\n".join([
+                  "return _startup_save_catalog.call(",
+                  "\t\t\"get_catalog\",",
+                  "\t\tFORMAL_SLOT_DEFINITIONS.duplicate(true),",
+                  "\t) as Dictionary",
+              ])
+              b2 = "\n".join([
+                  "var snapshot_result := _startup_save_catalog.call(",
+                  "\t\t\"get_catalog\",",
+                  "\t\tFORMAL_SLOT_DEFINITIONS.duplicate(true),",
+                  "\t) as Dictionary",
+                  "\tif not bool(snapshot_result.get(\"ok\", false)):",
+                  '\t\tprinterr("DIAG catalog snapshot fail: ", JSON.stringify(snapshot_result))',
+                  "\treturn snapshot_result",
+              ])
+              assert gf.count(a2) == 1, "catalog return anchor changed"
+              gf = gf.replace(a2, b2)
+              gf_path.write_text(gf, encoding="utf-8")
+              print("patched GameFlowHost.gd with catalog diagnostics (TEMP)")
+          else:
+              print("GameFlowHost diagnostics already present, skipping")
+
+          st_path = Path("ui/startup/StartupScreen.gd")
+          st = st_path.read_text(encoding="utf-8")
+          if "DIAG host failure result" not in st:
+              a3 = "func _host_failure_copy(result: Dictionary) -> String:"
+              b3 = a3 + '\n\tprinterr("DIAG host failure result: ", JSON.stringify(result))'
+              assert st.count(a3) == 1, "host_failure_copy anchor changed"
+              st = st.replace(a3, b3)
+              st_path.write_text(st, encoding="utf-8")
+              print("patched StartupScreen.gd with host-failure diagnostics (TEMP)")
+          else:
+              print("StartupScreen diagnostics already present, skipping")
           PY
 
       - name: Import project (web build)

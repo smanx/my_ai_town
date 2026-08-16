@@ -107,7 +107,7 @@ jobs:
           path: ${{ runner.temp }}/game-build
           key: web-build-v2-${{ env.GODOT_VERSION }}-${{ hashFiles('game/**') }}
 
-      - name: Patch Web device-id fallback (game/ untouched)
+      - name: Patch Web compatibility (game/ untouched)
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/game-build"
@@ -116,8 +116,6 @@ jobs:
 
           target = Path("world/presentation/ui/TownProviderCredentialStore.gd")
           store_path = Path("world/presentation/session/TownSessionSaveStore.gd")
-          gf_path = Path("world/presentation/game_flow/GameFlowHost.gd")
-          st_path = Path("ui/startup/StartupScreen.gd")
           marker = "# --- Web device-id fallback (injected by deploy-web.yml; repo game/ untouched) ---"
           old_line = "\tvar device_id := OS.get_unique_id().strip_edges()"
 
@@ -197,159 +195,7 @@ jobs:
           else:
               print("credential store already patched, skipping")
 
-          # ---- 2) TEMP diagnostics: catalog failures ----
-          gf = gf_path.read_text(encoding="utf-8")
-          if "DIAG catalog snapshot fail" not in gf:
-              a1 = "\n".join([
-                  "func _startup_catalog_snapshot() -> Dictionary:",
-                  "\tvar interrupted_recovery := _recover_interrupted_formal_overwrites()",
-                  "\tif not bool(interrupted_recovery.get(\"ok\", false)):",
-                  "\t\treturn interrupted_recovery",
-              ])
-              b1 = "\n".join([
-                  "func _startup_catalog_snapshot() -> Dictionary:",
-                  "\tvar interrupted_recovery := _recover_interrupted_formal_overwrites()",
-                  "\tif not bool(interrupted_recovery.get(\"ok\", false)):",
-                  '\t\tprinterr("DIAG catalog recovery fail: ", JSON.stringify(interrupted_recovery))',
-                  "\t\treturn interrupted_recovery",
-              ])
-              assert gf.count(a1) == 1, "startup_catalog_snapshot anchor changed"
-              gf = gf.replace(a1, b1)
-              a2 = "\n".join([
-                  "return _startup_save_catalog.call(",
-                  "\t\t\"get_catalog\",",
-                  "\t\tFORMAL_SLOT_DEFINITIONS.duplicate(true),",
-                  "\t) as Dictionary",
-              ])
-              b2 = "\n".join([
-                  "var snapshot_result := _startup_save_catalog.call(",
-                  "\t\t\"get_catalog\",",
-                  "\t\tFORMAL_SLOT_DEFINITIONS.duplicate(true),",
-                  "\t) as Dictionary",
-                  "\tif not bool(snapshot_result.get(\"ok\", false)):",
-                  '\t\tprinterr("DIAG catalog snapshot fail: ", JSON.stringify(snapshot_result))',
-                  "\treturn snapshot_result",
-              ])
-              assert gf.count(a2) == 1, "catalog return anchor changed"
-              gf = gf.replace(a2, b2)
-              gf_path.write_text(gf, encoding="utf-8")
-              print("patched GameFlowHost.gd with catalog diagnostics (TEMP)")
-          else:
-              print("GameFlowHost diagnostics already present, skipping")
-
-          # ---- 3) TEMP probe: one-shot web FS capability probe ----
-          gf2 = gf_path.read_text(encoding="utf-8")
-          if "DIAG probe user_root" not in gf2:
-              a4 = "\n".join([
-                  "func _startup_catalog_snapshot() -> Dictionary:",
-                  "\tvar interrupted_recovery := _recover_interrupted_formal_overwrites()",
-              ])
-              b4 = "\n".join([
-                  "func _startup_catalog_snapshot() -> Dictionary:",
-                  "\tif not FileAccess.file_exists(\"user://diag_probe_done\"):",
-                  "\t\tvar probe_user := ProjectSettings.globalize_path(\"user://\")",
-                  "\t\tprinterr(\"DIAG probe user_root=\", probe_user, \" exists=\", DirAccess.dir_exists_absolute(probe_user))",
-                  "\t\tvar mk1 := DirAccess.make_dir_absolute(probe_user.path_join(\"diag_probe_a\"))",
-                  "\t\tprinterr(\"DIAG probe mkdir_single err=\", mk1, \"(\", error_string(mk1), \")\")",
-                  "\t\tvar mk2 := DirAccess.make_dir_recursive_absolute(\"user://diag_probe_b/child\")",
-                  "\t\tprinterr(\"DIAG probe mkdir_recursive err=\", mk2, \"(\", error_string(mk2), \")\")",
-                  "\t\tvar pf := FileAccess.open(\"user://diag_probe_f.txt\", FileAccess.WRITE)",
-                  "\t\tprinterr(\"DIAG probe file_write_open=\", pf != null, \" err=\", FileAccess.get_open_error() if pf == null else \"ok\")",
-                  "\t\tif pf != null:",
-                  "\t\t\tpf.store_string(\"x\")",
-                  "\t\t\tpf.flush()",
-                  "\t\t\tprinterr(\"DIAG probe file_write_flush err=\", pf.get_error())",
-                  "\t\t\tpf = null",
-                  "\t\tvar mark := FileAccess.open(\"user://diag_probe_done\", FileAccess.WRITE)",
-                  "\t\tif mark != null:",
-                  "\t\t\tmark.store_string(\"1\")",
-                  "\t\t\tmark = null",
-                  "\tvar interrupted_recovery := _recover_interrupted_formal_overwrites()",
-              ])
-              assert gf2.count(a4) == 1, "probe anchor (startup_catalog_snapshot) changed"
-              gf2 = gf2.replace(a4, b4)
-              gf_path.write_text(gf2, encoding="utf-8")
-              print("patched GameFlowHost.gd with FS probe (TEMP)")
-          else:
-              print("FS probe already present, skipping")
-
-          # ---- 4) TEMP probe: lease root mkdir result (TownSessionSaveStore) ----
-          st1 = store_path.read_text(encoding="utf-8")
-          if "DIAG lease mkdir_recursive" not in st1:
-              a5 = "\n".join([
-                  "\tvar claim_path := _slot_archive_claim_path(slot_id)",
-                  "\tvar create_error := DirAccess.make_dir_recursive_absolute(",
-                  "\t\t_absolute(_slot_lease_root(slot_id)),",
-                  "\t)",
-                  "\tif create_error != OK:",
-                  "\t\treturn _failure(\"SESSION_SAVE_STORE_WRITE_FAILED\", true)",
-              ])
-              b5 = "\n".join([
-                  "\tvar claim_path := _slot_archive_claim_path(slot_id)",
-                  "\tvar create_error := DirAccess.make_dir_recursive_absolute(",
-                  "\t\t_absolute(_slot_lease_root(slot_id)),",
-                  "\t)",
-                  "\tprinterr(\"DIAG lease mkdir_recursive err=\", create_error, \"(\", error_string(create_error), \") path=\", _absolute(_slot_lease_root(slot_id)))",
-                  "\tif create_error != OK:",
-                  "\t\treturn _failure(\"SESSION_SAVE_STORE_WRITE_FAILED\", true)",
-              ])
-              assert st1.count(a5) == 1, "lease mkdir anchor changed"
-              st1 = st1.replace(a5, b5)
-              store_path.write_text(st1, encoding="utf-8")
-              print("patched TownSessionSaveStore.gd lease probe (TEMP)")
-          else:
-              print("lease probe already present, skipping")
-
-          # ---- 5) TEMP probe: claim candidate mkdir / owner write ----
-          st2 = store_path.read_text(encoding="utf-8")
-          if "DIAG candidate mkdir" not in st2:
-              a6 = "\n".join([
-                  "\tvar candidate_error := DirAccess.make_dir_absolute(_absolute(candidate_path))",
-                  "\tif candidate_error != OK:",
-                  "\t\treturn _failure(\"SESSION_SAVE_STORE_WRITE_FAILED\", true)",
-                  "\tvar owner_write := _write_owned_claim_record(",
-                  "\t\tcandidate_path,",
-                  "\t\tclaim_path,",
-                  "\t\towner,",
-                  "\t)",
-                  "\tif owner_write.get(\"ok\") != true:",
-                  "\t\t_remove_tree(candidate_path)",
-                  "\t\treturn owner_write",
-              ])
-              b6 = "\n".join([
-                  "\tvar candidate_error := DirAccess.make_dir_absolute(_absolute(candidate_path))",
-                  "\tprinterr(\"DIAG candidate mkdir err=\", candidate_error, \"(\", error_string(candidate_error), \") path=\", _absolute(candidate_path))",
-                  "\tif candidate_error != OK:",
-                  "\t\treturn _failure(\"SESSION_SAVE_STORE_WRITE_FAILED\", true)",
-                  "\tvar owner_write := _write_owned_claim_record(",
-                  "\t\tcandidate_path,",
-                  "\t\tclaim_path,",
-                  "\t\towner,",
-                  "\t)",
-                  "\tprinterr(\"DIAG candidate owner_write ok=\", owner_write.get(\"ok\", false), \" err=\", owner_write.get(\"errorCode\", \"\"))",
-                  "\tif owner_write.get(\"ok\") != true:",
-                  "\t\t_remove_tree(candidate_path)",
-                  "\t\treturn owner_write",
-              ])
-              assert st2.count(a6) == 1, "candidate mkdir anchor changed"
-              st2 = st2.replace(a6, b6)
-              store_path.write_text(st2, encoding="utf-8")
-              print("patched TownSessionSaveStore.gd claim probe (TEMP)")
-          else:
-              print("claim probe already present, skipping")
-
-          # ---- 6) TEMP diagnostics: host failure result ----
-          st3 = st_path.read_text(encoding="utf-8")
-          if "DIAG host failure result" not in st3:
-              a3 = "func _host_failure_copy(result: Dictionary) -> String:"
-              b3 = a3 + '\n\tprinterr("DIAG host failure result: ", JSON.stringify(result))'
-              assert st3.count(a3) == 1, "host_failure_copy anchor changed"
-              st3 = st3.replace(a3, b3)
-              st_path.write_text(st3, encoding="utf-8")
-              print("patched StartupScreen.gd with host-failure diagnostics (TEMP)")
-          else:
-              print("StartupScreen diagnostics already present, skipping")
-          # ---- 7) REAL FIX: Web 上 OS.get_process_id()==0 导致 claim 校验失败 ----
+          # ---- 2) REAL FIX: Web 上 OS.get_process_id()==0 导致 claim 校验失败 ----
           pid_helpers = '''
           # --- Web process-id fallback (injected by deploy-web.yml; repo game/ untouched) ---
           func _canonical_process_id_text(value: String) -> bool:

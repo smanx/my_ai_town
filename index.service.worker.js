@@ -4,7 +4,7 @@
 // Incrementing CACHE_VERSION will kick off the install event and force
 // previously cached resources to be updated from the network.
 /** @type {string} */
-const CACHE_VERSION = '1786902801|16737665';
+const CACHE_VERSION = '1787015158|13792713';
 /** @type {string} */
 const CACHE_PREFIX = '我的ai小镇-sw-cache-';
 const CACHE_NAME = CACHE_PREFIX + CACHE_VERSION;

@@ -89,7 +89,7 @@ jobs:
           # Textures: lossless -> lossy WebP
           find . -name '*.png.import' -print0 | xargs -0 -I{} sed -i \
             -e 's/^compress\/mode=0$/compress\/mode=1/' \
-            -e 's/^compress\/lossy_quality=.*$/compress\/lossy_quality=0.7/' {}
+            -e 's/^compress\/lossy_quality=.*$/compress\/lossy_quality=0.6/' {}
           # Audio: 44.1kHz stereo -> 22.05kHz mono (stays OGG)
           find . -name '*.wav.import' -print0 | xargs -0 -I{} sed -i \
             -e 's/^force\/mono=false$/force\/mono=true/' \
@@ -105,13 +105,14 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: ${{ runner.temp }}/game-build
-          key: web-build-v2-${{ env.GODOT_VERSION }}-${{ hashFiles('game/**') }}
+          key: web-build-v3-${{ env.GODOT_VERSION }}-${{ hashFiles('game/**') }}
 
       - name: Patch Web compatibility (game/ untouched)
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/game-build"
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           target = Path("world/presentation/ui/TownProviderCredentialStore.gd")
@@ -169,6 +170,26 @@ jobs:
           else:
               print("PWA already enabled in export_presets.cfg, skipping")
 
+          # ---- 4) Web 发行包不需要测试脚本，从导出预设排除整个 tests/ ----
+          preset = Path("export_presets.cfg")
+          cfg_text = preset.read_text(encoding="utf-8")
+          p3_start = cfg_text.index("[preset.3]")
+          p3_end = cfg_text.index("[preset.3.options]", p3_start)
+          p3_block = cfg_text[p3_start:p3_end]
+          if 'exclude_filter="tests/*"' not in p3_block:
+              # 幂等：仅在 Web 预设主块中写入一次。
+              p3_block = re.sub(
+                  r'^exclude_filter="[^"]*"$',
+                  'exclude_filter="tests/*"',
+                  p3_block,
+                  count=1,
+                  flags=re.M,
+              )
+              preset.write_text(cfg_text[:p3_start] + p3_block + cfg_text[p3_end:], encoding="utf-8")
+              print("patched export_presets.cfg: Web exclude_filter=tests/*")
+          else:
+              print("tests exclusion already present in Web preset, skipping")
+
           PY
 
       - name: Import project (web build)
@@ -180,7 +201,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/game-build
-          key: web-build-v2-${{ env.GODOT_VERSION }}-${{ hashFiles('game/**') }}
+          key: web-build-v3-${{ env.GODOT_VERSION }}-${{ hashFiles('game/**') }}
 
       - name: Export Web
         run: |

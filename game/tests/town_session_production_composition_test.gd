@@ -307,7 +307,10 @@ func _run() -> void:
 		_finish()
 		return
 	root.add_child(runtime)
-	for _frame_index in 64:
+	# Agent preparation starts after the first rendered frame. Keep a bounded
+	# margin here so slower renderers do not fail the composition test one frame
+	# before the first provider dispatch becomes observable.
+	for _frame_index in 96:
 		await process_frame
 	var startup := runtime.call("get_startup_result") as Dictionary
 	_expect_ok(startup, "configured production Town Runtime starts")
@@ -631,6 +634,101 @@ func _run() -> void:
 		"observer middle-button drag pans the same formal camera",
 	)
 	runtime.call("reset_observer_camera")
+	var manual_pause_for_observation := runtime.call(
+		"set_manual_paused",
+		true,
+	) as Dictionary
+	_expect_equal(
+		manual_pause_for_observation.get("ok"),
+		true,
+		"manual time pause is accepted before observation input",
+	)
+	var paused_drag_start := (
+		(runtime.call("get_runtime_state") as Dictionary).get(
+			"observerCameraPosition",
+			Vector2.ZERO,
+		) as Vector2
+	)
+	runtime.call("_unhandled_input", drag_press)
+	runtime.call("_unhandled_input", drag_motion)
+	runtime.call("_unhandled_input", drag_release)
+	_expect(
+		(runtime.call("get_runtime_state") as Dictionary).get(
+			"observerCameraPosition",
+			Vector2.ZERO,
+		) != paused_drag_start,
+		"manual time pause still allows observer camera dragging",
+	)
+	var paused_place_request := runtime.call(
+		"request_observe_place",
+		"花房咖啡馆",
+	) as Dictionary
+	_expect(
+		bool(paused_place_request.get("ok", false))
+			and bool(paused_place_request.get("pending", false)),
+		"manual time pause still accepts entering an indoor place",
+	)
+	for _frame_index in 80:
+		await process_frame
+		var paused_view := runtime.call("get_runtime_state") as Dictionary
+		if String(paused_view.get("viewMode", "town")) == "interior":
+			break
+	await _wait_avatar_place_transition(runtime)
+	_expect_equal(
+		(runtime.call("get_runtime_state") as Dictionary).get("viewMode"),
+		"interior",
+		"manual time pause completes the indoor transition",
+	)
+	var paused_indoor_hud := adapter.call("get_view_model", "town_hud") as Dictionary
+	var paused_indoor_actions := paused_indoor_hud.get("actions", {}) as Dictionary
+	var paused_indoor_camera := (
+		paused_indoor_hud.get("data", {}) as Dictionary
+	).get("camera", {}) as Dictionary
+	_expect_equal(
+		(paused_indoor_hud.get("data", {}) as Dictionary).get("mapInteraction", {})
+			.get("mode", ""),
+		"interior",
+		"indoor HUD publishes the active interior view mode",
+	)
+	_expect_equal(
+		paused_indoor_camera.get("canDrag"),
+		true,
+		"indoor HUD keeps camera dragging enabled",
+	)
+	_expect_equal(
+		paused_indoor_camera.get("canReset"),
+		true,
+		"indoor HUD keeps camera reset enabled",
+	)
+	for action_key: String in ["cameraZoomIn", "cameraZoomOut", "cameraReset"]:
+		_expect(
+			bool((paused_indoor_actions.get(action_key, {}) as Dictionary).get("enabled", false)),
+			"indoor HUD enables %s" % action_key,
+		)
+	var paused_return_request := runtime.call(
+		"request_return_to_town_overview",
+	) as Dictionary
+	_expect(
+		bool(paused_return_request.get("ok", false))
+			and bool(paused_return_request.get("pending", false)),
+		"manual time pause accepts returning from an indoor place",
+	)
+	for _frame_index in 80:
+		await process_frame
+		var paused_view_after_return := runtime.call("get_runtime_state") as Dictionary
+		if String(paused_view_after_return.get("viewMode", "town")) == "town":
+			break
+	await _wait_avatar_place_transition(runtime)
+	_expect_equal(
+		(runtime.call("get_runtime_state") as Dictionary).get("viewMode"),
+		"town",
+		"manual time pause completes the outdoor return",
+	)
+	_expect_equal(
+		(runtime.call("set_manual_paused", false) as Dictionary).get("ok"),
+		true,
+		"manual time pause can be cleared after indoor observation",
+	)
 	var pause_result := runtime.call("set_main_menu_open", true) as Dictionary
 	_expect_equal(pause_result.get("ok"), true, "Pause reason is accepted by the formal World")
 	var paused_camera_state := runtime.call("get_runtime_state") as Dictionary
@@ -1563,6 +1661,49 @@ func _verify_conversation_first_visible_frame(
 		messages_after_reply_agent.size() >= message_count_before_reply + 2,
 		"the prioritized resident reply still arrives after the player's reply frame",
 	)
+	# 回归真实生产页面的连续三轮交谈：第一轮覆盖上面的启动+回复，
+	# 这里再连续发送两次玩家回复，并等待每次居民回应。这个路径会
+	# 反复触发消息树退役、流式显示、焦点恢复和 Agent 下一帧派发，
+	# 是旧 Android 设备报告“第三轮崩溃”最接近的组合。
+	var chained_message_count := messages_after_reply_agent.size()
+	for round_index: int in 2:
+		var chained_reply := adapter.call(
+			"dispatch",
+			"conversation.reply",
+			{
+				"say": "继续聊第 %d 轮。" % (round_index + 2),
+				"narration": "旅行者继续交谈第 %d 轮" % (round_index + 2),
+			},
+		) as Dictionary
+		_expect_ok(
+			chained_reply,
+			"连续对话第 %d 轮的玩家回复仍由生产 Adapter 接受" % (round_index + 2),
+		)
+		var chained_player_frame := adapter.call("get_view_model", "conversation") as Dictionary
+		var chained_player_messages := (
+			chained_player_frame.get("data", {}) as Dictionary
+		).get("messages", []) as Array
+		_expect_equal(
+			chained_player_messages.size(),
+			chained_message_count + 1,
+			"连续对话第 %d 轮先显示玩家消息" % (round_index + 2),
+		)
+		runtime.call("_pump_agent_gateway_for_frame")
+		var resident_reply_visible := false
+		for _frame_index: int in 64:
+			await process_frame
+			var chained_current := adapter.call("get_view_model", "conversation") as Dictionary
+			var chained_current_messages := (
+				chained_current.get("data", {}) as Dictionary
+			).get("messages", []) as Array
+			if chained_current_messages.size() >= chained_message_count + 2:
+				resident_reply_visible = true
+				chained_message_count = chained_current_messages.size()
+				break
+		_expect(
+			resident_reply_visible,
+			"连续对话第 %d 轮的居民回复在 64 帧内可见" % (round_index + 2),
+		)
 	var conversation_id := String(
 		(conversation_after_reply_agent.get("data", {}) as Dictionary).get("conversationId", "")
 	)

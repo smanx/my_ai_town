@@ -202,6 +202,10 @@ var _agent_dispatch_first_draw_deadline_msec := 0
 var _agent_gateway_pump_scheduled := false
 var _agent_gateway_watchdog_active := false
 var _agent_gateway_pending_world_advance: Dictionary = {}
+# RenderingServer 的 one-shot 信号在 watchdog 与真实绘制帧同时到达时，
+# 可能还没来得及从引擎侧移除。单独保留本地状态，保证同一个 Runtime
+# 永远只有一条待处理的帧回调，避免旧设备上重复 connect 刷屏并拖慢主线程。
+var _agent_gateway_frame_callback_connected := false
 
 
 # Formal sessions mount TownEnvironmentPresentation after the world starts.
@@ -1756,15 +1760,15 @@ func _schedule_agent_gateway_pump(world_advance: Dictionary) -> void:
 		# after the current process turn, preserving physics-before-Agent order.
 		call_deferred("_pump_agent_gateway_after_avatar_frame")
 	else:
-		# The watchdog may have completed a previous pump before the renderer
-		# emitted frame_post_draw. Always remove that stale one-shot connection
-		# before scheduling the next frame, otherwise Godot rejects the duplicate
-		# connection and floods the main loop with errors.
-		_disconnect_agent_gateway_frame_callback()
-		RenderingServer.frame_post_draw.connect(
-			_pump_agent_gateway_after_avatar_frame,
-			CONNECT_ONE_SHOT,
-		)
+		# The watchdog and renderer can race. The local connection flag prevents
+		# a second one-shot registration while the first one is still owned by
+		# RenderingServer, which otherwise floods older devices with errors.
+		if not _agent_gateway_frame_callback_connected:
+			RenderingServer.frame_post_draw.connect(
+				_pump_agent_gateway_after_avatar_frame,
+				CONNECT_ONE_SHOT,
+			)
+			_agent_gateway_frame_callback_connected = true
 		# A minimized or temporarily unavailable renderer must not starve Agent
 		# work forever. Keep only one watchdog pending while normal draw signals
 		# continue to arrive; the callback is idempotent when the draw signal wins.
@@ -1786,23 +1790,57 @@ func _on_agent_gateway_pump_watchdog() -> void:
 
 
 func _disconnect_agent_gateway_frame_callback() -> void:
-	if RenderingServer.frame_post_draw.is_connected(
-		_pump_agent_gateway_after_avatar_frame,
+	if (
+		_agent_gateway_frame_callback_connected
+		and RenderingServer.frame_post_draw.is_connected(
+			_pump_agent_gateway_after_avatar_frame,
+		)
 	):
 		RenderingServer.frame_post_draw.disconnect(
 			_pump_agent_gateway_after_avatar_frame,
 		)
+	_agent_gateway_frame_callback_connected = false
 
 
 func _pump_agent_gateway_after_avatar_frame() -> void:
 	if not _agent_gateway_pump_scheduled:
+		# 可能是 watchdog 已经完成派发后，旧的 one-shot 才抵达；这时
+		# 连接已经没有后续用途，可以清掉本地状态。
+		_agent_gateway_frame_callback_connected = false
 		return
+	var callback_was_connected := _agent_gateway_frame_callback_connected
 	_agent_gateway_pump_scheduled = false
 	var world_advance := _agent_gateway_pending_world_advance.duplicate(true)
 	_agent_gateway_pending_world_advance.clear()
 	if not is_inside_tree() or _agent_gateway == null:
+		_agent_gateway_frame_callback_connected = false
 		return
 	_pump_agent_gateway_for_frame(world_advance)
+	# 必须等 pump 完整返回后再处理标记。pump 期间可能同步触发新的
+	# _schedule_agent_gateway_pump；帧信号还在发射时不能立即再次 connect，
+	# 但也不能丢掉这次重排队。交给 deferred 回调，在 one-shot 发射结束后
+	# 安全挂回下一帧；watchdog 路径已经先断开旧连接，可以直接保留新连接。
+	if callback_was_connected:
+		_agent_gateway_frame_callback_connected = false
+		if _agent_gateway_pump_scheduled:
+			call_deferred("_resume_agent_gateway_frame_callback")
+	elif not _agent_gateway_pump_scheduled:
+		_agent_gateway_frame_callback_connected = false
+
+
+func _resume_agent_gateway_frame_callback() -> void:
+	if not _agent_gateway_pump_scheduled or _agent_gateway_frame_callback_connected:
+		return
+	if RenderingServer.frame_post_draw.is_connected(
+		_pump_agent_gateway_after_avatar_frame,
+	):
+		_agent_gateway_frame_callback_connected = true
+		return
+	RenderingServer.frame_post_draw.connect(
+		_pump_agent_gateway_after_avatar_frame,
+		CONNECT_ONE_SHOT,
+	)
+	_agent_gateway_frame_callback_connected = true
 
 
 func player_end_conversation(conversation_id: String, narration: String) -> Dictionary:
@@ -2472,9 +2510,21 @@ func _observer_camera_accepts_input() -> bool:
 		_observer_camera_input_enabled
 		and _avatar_mode == AVATAR_MODE_OBSERVER
 		and _world != null
-		and not bool(_world.is_paused())
+		and _observer_camera_pause_allows_input()
 		and not _is_text_input_focused()
 	)
+
+
+func _observer_camera_pause_allows_input() -> bool:
+	if not bool(_world.is_paused()):
+		return true
+	# 手动暂停只冻结小镇时间，不冻结玩家的观察操作。暂停菜单、后台
+	# 暂停和居民编辑等覆盖页面仍然保留输入隔离，避免镜头或建筑入口在
+	# 页面下方继续响应。
+	var pause_reasons := (
+		_world.get_lifecycle_state().get("pauseReasons", []) as Array
+	)
+	return pause_reasons.size() == 1 and pause_reasons.has("manual")
 
 
 func _observer_camera_accepts_zoom_input() -> bool:
